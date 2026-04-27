@@ -59,6 +59,8 @@ class InformationSetBuilder:
         self.cache_size = max(0, int(cache_size))
         self._vector_cache = OrderedDict()
         self._feature_cache = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
         self._lock = threading.RLock()
 
         self.feature_schema = {
@@ -71,6 +73,13 @@ class InformationSetBuilder:
     def feature_schema_fingerprint(self):
         payload = f"{self.FEATURE_SCHEMA_VERSION}|{'|'.join(self.FEATURE_KEYS)}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def get_cache_stats(self):
+        total = self._cache_hits + self._cache_misses
+        return {
+            "feature_cache_hit_rate": self._cache_hits / max(1, total),
+            "feature_cache_size": len(self._vector_cache),
+        }
 
     @staticmethod
     def _round_values(values, digits: int = 4):
@@ -131,6 +140,9 @@ class InformationSetBuilder:
             cached = cache.get(cache_key)
             if cached is not None:
                 cache.move_to_end(cache_key)
+                self._cache_hits += 1
+            else:
+                self._cache_misses += 1
             return cached
 
     def _store_cached_payload(self, cache_key, vector, feature_map):

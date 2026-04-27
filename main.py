@@ -79,6 +79,10 @@ def parse_args():
         action="store_true",
         help="Enable stricter deterministic behavior (PyTorch deterministic algorithms + stable CuDNN settings)",
     )
+    parser.add_argument("--checkpoint-keep-last", type=int, default=0, help="Keep only the N most recent iter_XXXX.pt files (0 = keep all)")
+    parser.add_argument("--num-layers", type=int, default=2, help="Number of hidden layers for RegretNet and PolicyNet")
+    parser.add_argument("--hidden-dim", type=int, default=128, help="Hidden dimension for RegretNet and PolicyNet")
+    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate for RegretNet and PolicyNet (0.0 = disabled)")
     parser.add_argument("--experiment", type=str, default="poker_cfr_ai", help="MLflow experiment name")
     parser.add_argument("--command-file", type=str, default="artifacts/last_run_command.txt", help="File used to persist the Docker command")
     return parser.parse_args()
@@ -137,6 +141,7 @@ def main():
         run_name=args.run_name or None,
         resume_mode=args.resume_mode,
         seed=args.seed,
+        keep_last=args.checkpoint_keep_last,
     )
     run_context = checkpoint_manager.prepare_run()
     args.run_name = run_context["run_name"]
@@ -180,6 +185,9 @@ def main():
         torch_equity_device=args.torch_equity_device,
         use_amp=args.use_amp,
         use_torch_compile=args.use_torch_compile,
+        num_layers=args.num_layers,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
     )
 
     # --- INICIO DEL CAMBIO ---
@@ -253,6 +261,10 @@ def main():
     log_param("resumed_from_checkpoint", int(run_context["is_resumed"]))
     log_param("seed", args.seed)
     log_param("deterministic", int(args.deterministic))
+    log_param("checkpoint_keep_last", args.checkpoint_keep_last)
+    log_param("num_layers", args.num_layers)
+    log_param("hidden_dim", args.hidden_dim)
+    log_param("dropout", args.dropout)
     log_param("command_file", args.command_file)
     log_param("docker_command", command)
 

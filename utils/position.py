@@ -3,6 +3,8 @@ class Position:
     Positional helper for 2-9 handed simulations.
     """
 
+    __slots__ = ("num_players", "button")
+
     def __init__(self, num_players: int):
         if not 2 <= num_players <= 9:
             raise ValueError("num_players must be between 2 and 9")

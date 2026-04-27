@@ -1,4 +1,3 @@
-import copy
 from typing import Dict, List, Sequence, Tuple
 
 from env.poker_env import PokerEnv
@@ -19,7 +18,7 @@ class VectorizedPokerEnv:
     def from_template(cls, template_env: PokerEnv, batch_size: int):
         envs = []
         for _ in range(max(1, int(batch_size))):
-            envs.append(copy.deepcopy(template_env))
+            envs.append(template_env.clone())
         return cls(envs)
 
     def reset(self) -> List[Dict]:

@@ -70,7 +70,20 @@ class EquityLUT:
         )
         self._ensure_table_files()
 
+    def _warmup_hand(self, hand, num_players):
+        key = self.preflop_key(hand, num_players)
+        with self._lock:
+            if key in self.preflop_table:
+                return False
+        equity = self.lut_equity.estimate(hand, [], num_players=num_players)
+        with self._lock:
+            self.preflop_table[key] = equity
+            self._pending_saves["preflop"] += 1
+        return True
+
     def warmup_preflop(self, all_cards, max_players: int = 4):
+        from concurrent.futures import ThreadPoolExecutor
+
         print(f"\n[LUT] Pre-calentando la LUT Preflop (2 hasta {max_players} jugadores)...")
 
         seen_classes = set()
@@ -90,18 +103,12 @@ class EquityLUT:
             started = time.perf_counter()
             missing_count = 0
 
-            for hand in representative_hands:
-                key = self.preflop_key(hand, num_players)
-                with self._lock:
-                    exists = key in self.preflop_table
-                if exists:
-                    continue
-
-                missing_count += 1
-                equity = self.lut_equity.estimate(hand, [], num_players=num_players)
-                with self._lock:
-                    self.preflop_table[key] = equity
-                    self._pending_saves["preflop"] += 1
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(self._warmup_hand, hand, num_players)
+                           for hand in representative_hands]
+                for fut in futures:
+                    if fut.result():
+                        missing_count += 1
 
             elapsed = time.perf_counter() - started
             print(f"[LUT] {num_players} jugadores: Calculadas {missing_count} nuevas llaves ({elapsed:.1f}s).")

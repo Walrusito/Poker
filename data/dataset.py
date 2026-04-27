@@ -6,35 +6,50 @@ class AdvantageDataset(TorchDataset):
     """
     PyTorch-compatible Dataset wrapping a ReservoirBuffer for the regret net.
 
-    Each item is (features: Tensor, action_idx: int, advantage: float).
-    FIX: original Dataset.__getitem__ returned raw tuples without any tensor
-    conversion, causing runtime errors when used with DataLoader.
+    Pre-converts all buffer data to stacked tensors in __init__ for
+    zero-copy indexing in __getitem__.
     """
 
     def __init__(self, buffer):
-        self.data = buffer.sample()  # shuffled snapshot
+        data = buffer.sample()
+        features = []
+        actions = []
+        advantages = []
+        for x, a_idx, adv in data:
+            features.append(x.float() if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32))
+            actions.append(a_idx)
+            advantages.append(adv)
+        self._features = torch.stack(features, dim=0)
+        self._actions = torch.tensor(actions, dtype=torch.long)
+        self._advantages = torch.tensor(advantages, dtype=torch.float32)
 
     def __len__(self) -> int:
-        return len(self.data)
+        return self._features.size(0)
 
     def __getitem__(self, idx):
-        x, a_idx, adv = self.data[idx]
-        return x.float(), torch.tensor(a_idx, dtype=torch.long), torch.tensor(adv, dtype=torch.float32)
+        return self._features[idx], self._actions[idx], self._advantages[idx]
 
 
 class PolicyDataset(TorchDataset):
     """
     PyTorch-compatible Dataset wrapping a ReservoirBuffer for the policy net.
 
-    Each item is (features: Tensor, strategy: Tensor).
+    Pre-converts all buffer data to stacked tensors in __init__ for
+    zero-copy indexing in __getitem__.
     """
 
     def __init__(self, buffer):
-        self.data = buffer.sample()
+        data = buffer.sample()
+        features = []
+        strategies = []
+        for x, strategy in data:
+            features.append(x.float() if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32))
+            strategies.append(torch.tensor(strategy, dtype=torch.float32) if not isinstance(strategy, torch.Tensor) else strategy.float())
+        self._features = torch.stack(features, dim=0)
+        self._strategies = torch.stack(strategies, dim=0)
 
     def __len__(self) -> int:
-        return len(self.data)
+        return self._features.size(0)
 
     def __getitem__(self, idx):
-        x, strategy = self.data[idx]
-        return x.float(), torch.tensor(strategy, dtype=torch.float32)
+        return self._features[idx], self._strategies[idx]
