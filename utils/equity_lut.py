@@ -6,6 +6,7 @@ Postflop uses structural buckets instead of exact-card keys.
 """
 
 import json
+import pickle
 import threading
 import time
 from pathlib import Path
@@ -273,6 +274,11 @@ class EquityLUT:
 
     @staticmethod
     def _load_table(path: Path, fallback: Path = None) -> dict:
+        pkl_path = path.with_suffix(".pkl")
+        if pkl_path.exists():
+            with pkl_path.open("rb") as fh:
+                return pickle.load(fh)
+
         target = path
         if not target.exists() and fallback is not None and fallback.exists():
             target = fallback
@@ -283,10 +289,16 @@ class EquityLUT:
 
     @staticmethod
     def _save_table(path: Path, table: dict):
-        tmp = path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
+        pkl_path = path.with_suffix(".pkl")
+        tmp = pkl_path.with_suffix(".tmp")
+        with tmp.open("wb") as fh:
+            pickle.dump(table, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(pkl_path)
+
+        json_tmp = path.with_suffix(".json.tmp")
+        with json_tmp.open("w", encoding="utf-8") as fh:
             json.dump(table, fh, indent=2, sort_keys=True)
-        tmp.replace(path)
+        json_tmp.replace(path)
 
     def _street_paths(self, street: str):
         if street == "preflop":

@@ -70,12 +70,12 @@ class HandEquity:
         if len(available) < cards_per_sim:
             return 0.5
 
-        # Generación vectorizada de todos los repartos de una sola vez
-        # Reemplaza los miles de shuffle de Python por una operación de bloque en NumPy
-        all_deals = np.array([
-            self.rng.choice(available, size=cards_per_sim, replace=False)
-            for _ in range(simulations)
-        ])
+        n_avail = len(available)
+        perms = np.empty((simulations, cards_per_sim), dtype=np.int32)
+        for i in range(simulations):
+            idx = self.rng.choice(n_avail, size=cards_per_sim, replace=False)
+            perms[i] = available[idx]
+        all_deals = perms
 
         batch_size = 128  # Aumentado para mejor aprovechamiento de evaluate_7_batch
         for batch_start in range(0, simulations, batch_size):

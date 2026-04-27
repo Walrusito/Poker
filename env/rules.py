@@ -16,7 +16,8 @@ def suit(card: int) -> int:
     return card // 13
 
 
-_EVAL7_CARD_MAP = []
+_EVAL7_CARD_MAP: list = []
+_EVAL7_CARD_TUPLE: tuple = ()
 if eval7 is not None:
     ranks_str = "23456789TJQKA"
     suits_str = "shdc"
@@ -24,6 +25,7 @@ if eval7 is not None:
         rank_str = ranks_str[card % 13]
         suit_str = suits_str[card // 13]
         _EVAL7_CARD_MAP.append(eval7.Card(rank_str + suit_str))
+    _EVAL7_CARD_TUPLE = tuple(_EVAL7_CARD_MAP)
 
 
 @lru_cache(maxsize=131072)
@@ -78,11 +80,9 @@ def evaluate_7_batch(card_lists: List[List[int]]) -> List[Any]:
     if eval7 is None:
         return [evaluate_7(cards) for cards in card_lists]
 
-    out = []
-    for cards in card_lists:
-        eval7_cards = [_EVAL7_CARD_MAP[card] for card in cards]
-        out.append((9, int(eval7.evaluate(eval7_cards))))
-    return out
+    cmap = _EVAL7_CARD_TUPLE
+    _eval = eval7.evaluate
+    return [(9, int(_eval([cmap[c] for c in cards]))) for cards in card_lists]
 
 
 def _is_straight(ranks: List[int]) -> Tuple[bool, int]:

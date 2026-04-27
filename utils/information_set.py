@@ -1,11 +1,19 @@
 from collections import OrderedDict
 import hashlib
+import struct
 import threading
 
 import numpy as np
 
 from utils.card_abstraction import CardAbstraction
 from utils.math_features import compute_effective_stack, compute_implied_odds, compute_pot_odds
+
+_ZOBRIST_CARD = tuple(hash(("card", i)) for i in range(53))
+_ZOBRIST_PLAYER = tuple(hash(("player", i)) for i in range(10))
+_ZOBRIST_STREET = {"preflop": hash("preflop"), "flop": hash("flop"),
+                   "turn": hash("turn"), "river": hash("river"),
+                   "showdown": hash("showdown")}
+_PACK_FLOAT = struct.Struct("!d")
 
 
 class InformationSetBuilder:
@@ -68,37 +76,55 @@ class InformationSetBuilder:
     def _round_values(values, digits: int = 4):
         return tuple(round(float(value), digits) for value in values)
 
+    @staticmethod
+    def _hash_float(h: int, value: float) -> int:
+        return h ^ hash(_PACK_FLOAT.pack(round(value, 4)))
+
     def _state_key(self, state, player: int):
         if self.cache_size == 0:
             return None
 
-        recent_history = tuple(
-            (int(actor), str(action))
-            for actor, action in state.get("history", [])[-4:]
-        )
-        return (
-            int(player),
-            state.get("street"),
-            tuple(sorted(state["hands"][player])),
-            tuple(state.get("board", [])),
-            int(state.get("num_players", len(state.get("hands", [])))),
-            tuple(bool(flag) for flag in state.get("active", [])),
-            self._round_values([state.get("pot", 0.0)]),
-            self._round_values(state.get("bets", [])),
-            self._round_values(state.get("stacks", [])),
-            self._round_values(state.get("contributions", [])),
-            self._round_values(
-                [
-                    state.get("starting_stack", 0.0),
-                    state.get("big_blind", 0.0),
-                    state.get("last_raise_size", 0.0),
-                ]
-            ),
-            state.get("button"),
-            state.get("last_aggressor"),
-            tuple(state.get("pending_players", [])),
-            recent_history,
-        )
+        h = _ZOBRIST_PLAYER[player]
+        h ^= _ZOBRIST_STREET.get(state.get("street"), 0)
+
+        hand = state["hands"][player]
+        for card in sorted(hand):
+            h ^= _ZOBRIST_CARD[card]
+
+        for card in state.get("board", []):
+            h ^= _ZOBRIST_CARD[card] * 31
+
+        h ^= hash(state.get("num_players", 2)) * 997
+
+        active = state.get("active", [])
+        active_bits = 0
+        for i, flag in enumerate(active):
+            if flag:
+                active_bits |= (1 << i)
+        h ^= active_bits * 7919
+
+        h = self._hash_float(h, state.get("pot", 0.0))
+        for v in state.get("bets", []):
+            h = self._hash_float(h, v)
+        for v in state.get("stacks", []):
+            h = self._hash_float(h, v)
+        for v in state.get("contributions", []):
+            h = self._hash_float(h, v)
+        h = self._hash_float(h, state.get("starting_stack", 0.0))
+        h = self._hash_float(h, state.get("big_blind", 0.0))
+        h = self._hash_float(h, state.get("last_raise_size", 0.0))
+
+        h ^= hash(state.get("button")) * 1009
+        h ^= hash(state.get("last_aggressor")) * 2003
+
+        pending = state.get("pending_players", [])
+        for i, seat in enumerate(pending):
+            h ^= hash((i, seat)) * 4007
+
+        for actor, action in state.get("history", [])[-4:]:
+            h ^= hash((int(actor), action)) * 8009
+
+        return h
 
     def _cache_lookup(self, cache, cache_key):
         with self._lock:

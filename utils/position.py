@@ -37,6 +37,12 @@ class Position:
     def first_to_act_postflop(self, active=None) -> int:
         return self.next_player(self.button, active)
 
+    def clone(self):
+        new = object.__new__(Position)
+        new.num_players = self.num_players
+        new.button = self.button
+        return new
+
     def relative_position(self, player: int) -> float:
         if self.num_players == 1:
             return 0.0
