@@ -92,6 +92,41 @@ class PokerEnv:
             big_blind=self.big_blind,
         )
 
+    def clone(self):
+        new = object.__new__(PokerEnv)
+        new.num_players = self.num_players
+        new.starting_stack = self.starting_stack
+        new.small_blind = self.small_blind
+        new.big_blind = self.big_blind
+        new.reward_unit = self.reward_unit
+        new.seed = self.seed
+        new.rng = self.rng
+        new.bet_sizing = self.bet_sizing
+        new.ACTIONS = self.ACTIONS
+        new.position = self.position.clone()
+        new.hand_index = self.hand_index
+        new.reference_player = self.reference_player
+        new.deck = self.deck[:]
+        new.hands = [h[:] for h in self.hands]
+        new.board = self.board[:]
+        new.pot = self.pot
+        new.contributions = self.contributions[:]
+        new.bets = self.bets[:]
+        new.stacks = self.stacks[:]
+        new.active = self.active[:]
+        new.street = self.street
+        new.history = self.history[:]
+        new.done = self.done
+        new.pending_players = self.pending_players[:]
+        new.current_player = self.current_player
+        new.last_raise_size = self.last_raise_size
+        new.last_aggressor = self.last_aggressor
+        new.last_action = self.last_action
+        new.street_actions = self.street_actions
+        new.last_terminal_utilities = self.last_terminal_utilities[:]
+        new.last_winners = self.last_winners[:]
+        return new
+
     def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, Dict]:
         if self.done:
             return self._get_state(), 0.0, True, {}

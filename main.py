@@ -10,7 +10,7 @@ from env.poker_env import PokerEnv
 from train.train_deep_cfr import DeepCFRTrainer
 from utils.checkpointing import CheckpointManager
 from utils.command_persistence import persist_run_command
-from utils.logging import end_experiment, log_artifact, log_param, start_experiment_run
+from utils.logging import end_experiment, log_artifact, log_metrics_batch, log_param, start_experiment_run
 
 
 def parse_args():

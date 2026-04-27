@@ -20,7 +20,7 @@ from models.regret_net import RegretNet
 from env.vectorized_poker_env import VectorizedPokerEnv
 from utils.action_abstraction import DEFAULT_ACTIONS
 from utils.information_set import InformationSetBuilder
-from utils.logging import log_metric
+from utils.logging import log_metric, log_metrics_batch
 from utils.run_comparison import collect_population_checkpoints
 
 
@@ -543,7 +543,7 @@ class DeepCFRTrainer:
         pending_envs = []
 
         for _ in range(self.rollout_samples_per_action):
-            next_env = copy.deepcopy(env)
+            next_env = env.clone()
             _, _, done, info = next_env.step(action)
             if done:
                 total_utilities += self._terminal_utilities(next_env, info)
@@ -584,7 +584,7 @@ class DeepCFRTrainer:
 
         for _ in range(episodes):
             self.env.reset()
-            episode_envs.append(copy.deepcopy(self.env))
+            episode_envs.append(self.env.clone())
             seeds.append(self._next_seed())
 
         progress_every = max(1, episodes // 5)
@@ -669,7 +669,7 @@ class DeepCFRTrainer:
         chosen_idx, chosen_action = self._sample_action(strategy, legal_actions, rng)
         action_utility_vectors = np.zeros((self.num_actions, env.num_players), dtype=np.float32)
 
-        chosen_env = copy.deepcopy(env)
+        chosen_env = env.clone()
         _, _, done, info = chosen_env.step(chosen_action)
         if done:
             chosen_utility = self._terminal_utilities(chosen_env, info)
@@ -1366,21 +1366,16 @@ class DeepCFRTrainer:
             self.metrics_history.append({"iteration": iteration_number, **metrics})
             self._save_checkpoint(iteration_number, metrics)
 
-            for metric_name, metric_value in metrics.items():
-                log_metric(metric_name, metric_value, iteration_number)
-
-            # Curated subset for quick line dashboards in MLflow.
+            all_metrics = dict(metrics)
             for metric_name in self.IMPORTANT_METRIC_KEYS:
                 metric_value = metrics.get(metric_name)
-                if metric_value is None:
-                    continue
-                log_metric(f"important/{metric_name}", metric_value, iteration_number)
-
+                if metric_value is not None:
+                    all_metrics[f"important/{metric_name}"] = metric_value
             for seat, seat_ev in enumerate(self_play_metrics["seat_ev_bb_per_hand"]):
-                log_metric(f"self_play_seat_{seat}_ev", seat_ev, iteration_number)
-
+                all_metrics[f"self_play_seat_{seat}_ev"] = seat_ev
             for seat, seat_ev in enumerate(vs_random_metrics["hero_seat_ev_bb_per_hand"]):
-                log_metric(f"vs_random_seat_{seat}_ev", seat_ev, iteration_number)
+                all_metrics[f"vs_random_seat_{seat}_ev"] = seat_ev
+            log_metrics_batch(all_metrics, step=iteration_number)
 
             reached_min_iters = iteration_number >= max(1, int(early_stop_min_iters))
             if reached_min_iters:
