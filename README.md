@@ -10,17 +10,26 @@ No es un solver GTO exacto. El repositorio implementa una aproximacion basada en
 - dos redes compartidas entre asientos (`RegretNet` y `PolicyNet`),
 - self-play con rollouts para estimar utilidades de acciones no muestreadas.
 
-## Estado actual
+## Estado actual (abril 2026)
 
-La base es funcional para experimentacion, pero sigue siendo un sistema aproximado y no una plataforma de produccion.
+El proyecto esta en una fase **estable para investigacion aplicada**, con pipeline de entrenamiento/evaluacion operativo en Docker, pero aun lejos de un solver teoricamente canonico o una plataforma de produccion.
 
-- La suite `pytest` pasa completa (`43` tests).
-- El entrypoint `main.py` arranca y ejecuta el warmup preflop correctamente.
-- Las utilidades terminales se preservan en bruto, manteniendo zero-sum en entrenamiento y evaluacion multiway.
-- La cache de `InformationSetBuilder` invalida correctamente los campos relevantes del estado.
-- La reanudacion de checkpoints valida la configuracion del entorno antes de cargar `env_state`.
-- La implementacion sigue siendo una aproximacion estilo Deep CFR y no mantiene garantias teoricas de convergencia a equilibrio de Nash multiway.
-- Metricas como `robust_score` y `exploitability_proxy` son proxies operativos, no medidas teoricas exactas.
+### Lo que ya esta consolidado
+
+- Entrenamiento end-to-end con `main.py` + `DeepCFRTrainer`, incluyendo warmup preflop de LUT al inicio de la run.
+- Reanudacion de runs via `CheckpointManager` con validaciones de compatibilidad de entorno, arquitectura y parametros clave.
+- Evaluacion contra multiples baselines (`random`, `heuristic`, `snapshot_pool`, `population`) con registro de metricas por iteracion.
+- Cross-play entre runs con `cross_play_matrix.py`, seleccion de top-runs y export opcional a CSV.
+- Persistencia dual de checkpoints:
+  - `*.pt` completos para continuar entrenamiento.
+  - `*_policy.pt` ligeros para evaluacion/cross-play mas rapido.
+- Integracion con MLflow (tags, params, artefactos, estado final `FINISHED`/`FAILED`) y trazabilidad de comando en `artifacts/last_run_command.txt`.
+
+### Limites actuales (importante)
+
+- Sigue siendo una aproximacion estilo Deep CFR con abstracciones y aproximaciones de equity; no hay garantia de convergencia Nash multiway.
+- `exploitability_proxy`, `robust_score` y metricas similares son indicadores operativos, no medidas teoricas exactas.
+- El rendimiento todavia esta condicionado por copias profundas del entorno, caches no siempre acotadas y coste de I/O de LUT/checkpoints.
 
 ## Objetivo del proyecto
 
@@ -79,7 +88,7 @@ El objetivo practico es entrenar, evaluar y comparar politicas aproximadas de po
   MLP para predecir una distribucion de accion.
 
 - `utils/checkpointing.py`
-  Gestion de `latest.pt`, `best.pt`, `best_robust.pt` y `run_summary.json`.
+  Gestion de checkpoints completos, snapshots ligeros de politica y `run_summary.json`.
 
 - `compare_runs.py`
   Ranking tabular de runs.
@@ -218,6 +227,83 @@ Metricas destacadas:
 - `robust_score`
 - `exploitability_proxy`
 
+## Como interpretar `exploitability_proxy` y `robust_score`
+
+Estas dos metricas se deben leer en **2 capas**:
+
+1. **Capa practica (operativa)**: sirven para detectar degradaciones, comparar runs y priorizar decisiones de entrenamiento.
+2. **Capa teorica (limite actual)**: no equivalen a exploitability exacta ni demuestran convergencia a equilibrio de Nash.
+
+### Regla de oro
+
+- No tomes decisiones con una sola metrica aislada.
+- Evalua siempre junto con `vs_random_bb_per_100`, `vs_heuristic_bb_per_100`, `vs_snapshot_bb_per_100` y `vs_population_bb_per_100`.
+- Si puedes, compara con el mismo benchmark/seed para reducir varianza.
+
+### Reach weighting y clipping (nuevo)
+
+- El trainer ahora admite weighting CFR-style por reach para regrets/policy (`--disable-reach-weighting`, `--reach-weight-mode`).
+- El clipping puede ser fijo (`--reach-weight-clip`) o automatico por cuantiles (`--reach-auto-clip-quantile`, activo salvo `--disable-reach-auto-clip`).
+- **Valor optimo recomendado**: en esta implementacion los pesos de reach estan acotados en `[0,1]`, por lo que el clip teorico optimo es `1.0` (cualquier valor mayor no aporta recorte real).
+- En ejecucion se reporta `reach_weight_clip_optimal` y percentiles (`reach_weight_raw_p50/p95/p99`) para validar si conviene mantener `1.0` o bajar el umbral en modo conservador.
+
+### Rangos recomendados para `exploitability_proxy`
+
+**Interpretacion general**: menor suele ser mejor, porque sugiere menos vulnerabilidad relativa bajo el proxy actual.
+
+- `< 0.10`:
+  - Lectura: muy buena senal operativa.
+  - Por que: la politica aparenta consistencia y menos huecos explotables bajo la evaluacion actual.
+  - Que hacer: validar que tambien mejora o mantiene `bb/100` en `snapshot/population` antes de promoverla.
+- `0.10 - 0.30`:
+  - Lectura: razonable para investigacion; aun hay margen de mejora.
+  - Por que: suele reflejar compromiso entre exploracion y estabilidad de politica.
+  - Que hacer: continuar entrenamiento y revisar tendencia por iteraciones (no solo valor puntual).
+- `0.30 - 0.60`:
+  - Lectura: zona de alerta moderada.
+  - Por que: puede indicar abstraccion insuficiente, sobreajuste al self-play o ruido de estimacion.
+  - Que hacer: revisar regimen (entropia, smoothing, epochs), y comprobar si cross-play tambien cae.
+- `> 0.60`:
+  - Lectura: alerta alta.
+  - Por que: la politica probablemente presenta patrones explotables fuertes bajo este esquema de medida.
+  - Que hacer: no usar como candidato principal; auditar entrenamiento, evaluacion y calidad de muestras.
+
+### Rangos recomendados para `robust_score`
+
+**Interpretacion general**: mayor suele ser mejor, porque resume robustez empirica frente a baselines/pools.
+
+- `> 0.65`:
+  - Lectura: robustez empirica alta.
+  - Por que: la politica suele sostener rendimiento en varios escenarios, no solo en uno.
+  - Que hacer: candidata a `best_robust`, pero confirmar con cross-play y varianza.
+- `0.45 - 0.65`:
+  - Lectura: robustez intermedia aceptable.
+  - Por que: suele haber fortalezas parciales, con sensibilidad a tipo de rival o configuracion.
+  - Que hacer: mejorar generalizacion (pool mas diverso, evaluacion estable, no-regresion).
+- `0.25 - 0.45`:
+  - Lectura: robustez debil.
+  - Por que: el agente puede estar aprendiendo lineas fragiles o demasiado dependientes del entorno de entrenamiento.
+  - Que hacer: revisar diversidad de oponentes, abstraccion de acciones/features y estabilidad de entrenamiento.
+- `< 0.25`:
+  - Lectura: robustez muy baja.
+  - Por que: alta probabilidad de degradacion fuera del caso entrenado.
+  - Que hacer: tratar como run experimental/no promotable hasta corregir causas.
+
+### Como usar ambos juntos (decision practica)
+
+- **Caso A (bueno)**: `exploitability_proxy` baja + `robust_score` alta -> candidato fuerte.
+- **Caso B (inestable)**: `exploitability_proxy` baja + `robust_score` baja -> posible sobreajuste al proxy; mirar cross-play y pools.
+- **Caso C (ruidoso)**: `exploitability_proxy` alta + `robust_score` alta -> rendimiento empirico bueno pero con vulnerabilidades detectadas; vigilar regresiones.
+- **Caso D (malo)**: `exploitability_proxy` alta + `robust_score` baja -> descartar para promocion.
+
+### Siguiente salto recomendado (capa teorica)
+
+Para acercar estas lecturas a teoria de juegos:
+
+- introducir una aproximacion de best response por sampling,
+- reforzar weighting por reach probability en el trainer,
+- mantener benchmarks congelados (misma seed y mismos rivales) para comparar runs con menos ruido.
+
 ## Requisitos
 
 ### Docker
@@ -313,6 +399,11 @@ docker compose run --rm --entrypoint python poker-ai cross_play_matrix.py --chec
 - `--population-mix-prob`
 - `--policy-smoothing-alpha`
 - `--entropy-regularization`
+- `--disable-reach-weighting`
+- `--reach-weight-mode` (`linear` / `sqrt`)
+- `--reach-weight-clip`
+- `--disable-reach-auto-clip`
+- `--reach-auto-clip-quantile`
 - `--checkpoint-dir`
 - `--resume-mode`
 - `--seed`
@@ -326,16 +417,25 @@ Cada run escribe en `artifacts/checkpoints/<experimento>/<run_name>/`:
 - `best.pt`
 - `best_robust.pt`
 - `iter_XXXX.pt`
+- `latest_policy.pt`
+- `best_policy.pt`
+- `best_robust_policy.pt`
+- `policy_iter_XXXX.pt`
 - `run_summary.json`
 
-Tambien se persiste el comando ejecutado en `artifacts/last_run_command.txt` o en la ruta configurada con `--command-file`.
+Notas:
+
+- Los `*.pt` completos conservan redes, optimizadores, buffers y RNG para reanudar entrenamiento.
+- Los `*_policy.pt` guardan solo lo necesario para reconstruir `PolicyNet` y acelerar evaluacion, snapshot pool y cross-play.
+- En checkpoints nuevos ya no se persiste `env_state` completo; se guarda `env_config`, que es suficiente para validar compatibilidad sin pagar el coste de serializar el entorno entero.
+- Tambien se persiste el comando ejecutado en `artifacts/last_run_command.txt` o en la ruta configurada con `--command-file`.
 
 ## Limitaciones conocidas
 
 ### Correctitud
 
 - El proyecto sigue usando una aproximacion de juego y de regret, no un solving exacto del arbol.
-- La validacion de `resume` protege la configuracion del entorno, pero no bloquea todavia todos los cambios posibles de hiperparametros de entrenamiento.
+- La validacion de `resume` ya bloquea incompatibilidades de entorno, arquitectura y varios hiperparametros criticos, pero todavia no cubre absolutamente toda la configuracion operativa posible.
 
 ### Teoria de juegos / poker
 
@@ -347,37 +447,36 @@ Tambien se persiste el comando ejecutado en `artifacts/last_run_command.txt` o e
 
 - El recorrido usa muchos `copy.deepcopy`.
 - Los caches de equity exacta no estan acotados en memoria.
-- Los checkpoints guardan buffers completos y estado del entorno, lo que escala mal en disco y tiempo de carga.
+- Los checkpoints completos siguen guardando buffers completos, lo que puede crecer bastante en disco, aunque ahora se evita persistir `env_state` y se generan snapshots ligeros de politica para evaluacion.
 - La LUT se reescribe como JSON completo de forma periodica, con alto coste de I/O.
 
 ### Operacion
 
-- El wrapper de MLflow silencia errores y puede hacer que una run parezca sana aunque el tracking haya fallado.
-- `resume_mode=auto` favorece conveniencia; hoy valida la compatibilidad del entorno, pero no toda la configuracion del trainer.
+- `resume_mode=auto` favorece conveniencia; aunque ahora valida mas configuracion del trainer, sigue siendo recomendable abrir una run nueva si cambias el regimen de entrenamiento de forma deliberada.
+- `mlflow-ui` y el contenedor de entrenamiento deben mantenerse con la misma version de MLflow para evitar inconsistencias visuales o de backend.
 
-## Mejoras futuras recomendadas
+## Mejoras futuras recomendadas (roadmap)
 
-### Correctitud y robustez
+### Prioridad alta: operacion y confianza experimental
 
-- Extender la validacion de checkpoints para cubrir tambien hiperparametros del trainer.
-- Añadir tests de humo automaticos para el entrypoint real.
-- Añadir pruebas de no-regresion sobre metricas y evaluacion multiway.
+- Endurecer aun mas la observabilidad en MLflow (fallos de tracking visibles, metadatos de resume mas explicitos).
+- Añadir smoke tests del flujo real de `main.py` en CI (inicio run -> entrenamiento corto -> checkpoint -> cierre run).
+- Expandir validaciones de compatibilidad de `resume` (incluyendo regimen de entrenamiento y configuracion completa de redes/optimizadores).
+- Homogeneizar versiones de runtime (entrenamiento y `mlflow-ui`) para evitar divergencias de visualizacion/tracking.
 
-### ML y optimizacion
+### Prioridad media: calidad de senal y estabilidad numerica
 
-- Pasar `PolicyNet` a logits + `log_softmax` para mejorar estabilidad numerica.
-- Sustituir `copy.deepcopy` por clonado estructural del entorno.
-- Separar checkpoints completos de snapshots ligeros solo-con-pesos.
-- Acotar caches y medir su impacto con profiling.
-- Mover la persistencia de LUT a un formato incremental mas eficiente.
+- Mejorar evaluacion (benchmarks mas estables y mejor separacion de metricas por baseline).
+- Evolucionar `PolicyNet` a esquema de logits + `log_softmax` si encaja con el pipeline actual.
+- Reforzar pruebas de no-regresion en metricas clave y escenarios multiway.
+- Afinar abstraccion de acciones/sizings por `street`, `SPR` y contexto de apuesta.
 
-### Poker y teoria de juegos
+### Prioridad media-baja: teoria y escalabilidad
 
-- Separar politicas por jugador o, como minimo, por rol y posicion efectiva.
-- Introducir weighting correcto por reach probability.
-- Incorporar evaluacion aproximada de best response.
-- Mejorar la abstraccion de sizings por street y por SPR.
-- Añadir features de rangos, blockers y textura del board mas fieles a NLHE real.
+- Incorporar weighting mas fiel por reach probability y acercar el trainer a variantes mas canonicas de Deep CFR.
+- Evaluar politicas separadas por rol/posicion efectiva para reducir mezcla estrategica excesiva.
+- Reducir coste de `copy.deepcopy` con clonado estructural del entorno.
+- Migrar persistencia de LUT a formato incremental/binario para bajar I/O y tiempo de guardado.
 
 ## Desarrollo y calidad
 

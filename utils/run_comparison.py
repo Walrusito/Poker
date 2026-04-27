@@ -5,6 +5,7 @@ from pathlib import Path
 
 def _rank_value(summary):
     for key in (
+        "best_robust_score",
         "best_vs_population_bb_per_100",
         "best_vs_snapshot_bb_per_100",
         "best_vs_random_bb_per_100",
@@ -41,14 +42,20 @@ def collect_run_summaries(root_dir: str, experiment: str):
                 "best_vs_snapshot_bb_per_100": payload.get("best_vs_snapshot_bb_per_100"),
                 "best_vs_population_bb_per_100": payload.get("best_vs_population_bb_per_100"),
                 "best_vs_heuristic_bb_per_100": payload.get("best_vs_heuristic_bb_per_100"),
+                "best_vs_heuristic_pool_bb_per_100": payload.get("best_vs_heuristic_pool_bb_per_100"),
+                "best_robust_score": payload.get("best_robust_score"),
+                "best_robust_iteration": payload.get("best_robust_iteration"),
                 "latest_vs_random_bb_per_100": latest_metrics.get("vs_random_bb_per_100"),
                 "latest_vs_snapshot_bb_per_100": latest_metrics.get("vs_snapshot_bb_per_100"),
                 "latest_vs_population_bb_per_100": latest_metrics.get("vs_population_bb_per_100"),
                 "latest_vs_heuristic_bb_per_100": latest_metrics.get("vs_heuristic_bb_per_100"),
+                "latest_robust_score": latest_metrics.get("robust_score"),
                 "latest_self_play_seat_ev_std": latest_metrics.get("self_play_seat_ev_std"),
                 "run_dir": str(run_dir),
                 "best_checkpoint": str(run_dir / "best.pt"),
                 "latest_checkpoint": str(run_dir / "latest.pt"),
+                "best_policy_checkpoint": str(run_dir / "best_policy.pt") if (run_dir / "best_policy.pt").exists() else None,
+                "latest_policy_checkpoint": str(run_dir / "latest_policy.pt") if (run_dir / "latest_policy.pt").exists() else None,
                 "ranking_value": _rank_value(payload),
             }
         )
@@ -71,7 +78,9 @@ def collect_population_checkpoints(
         if exclude_run_dir is not None and Path(summary["run_dir"]) == Path(exclude_run_dir):
             continue
 
-        checkpoint_path = Path(summary["run_dir"]) / checkpoint_name
+        policy_name = checkpoint_name.replace(".pt", "_policy.pt")
+        policy_checkpoint_path = Path(summary["run_dir"]) / policy_name
+        checkpoint_path = policy_checkpoint_path if policy_checkpoint_path.exists() else (Path(summary["run_dir"]) / checkpoint_name)
         if checkpoint_path.exists():
             checkpoints.append(str(checkpoint_path))
 

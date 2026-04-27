@@ -1,5 +1,5 @@
+import hashlib
 import itertools
-import random
 import threading
 from collections import OrderedDict
 
@@ -31,7 +31,17 @@ class HandEquity:
         self._lock = threading.RLock()
         self.use_torch_backend = bool(use_torch_backend)
         self.torch_device = torch_device
-        self.rng = np.random.default_rng(seed)
+
+    def _query_seed(self, hand, board, num_players, simulations) -> int:
+        payload = bytearray()
+        payload.extend(str(self.seed).encode("utf-8"))
+        payload.extend(b"|")
+        payload.extend(bytes(sorted(int(card) for card in hand)))
+        payload.extend(b"|")
+        payload.extend(bytes(int(card) for card in board))
+        payload.extend(f"|{int(num_players)}|{int(simulations)}".encode("utf-8"))
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, "big", signed=False)
 
     def estimate(self, hand, board=None, num_players: int = 2):
         if board is None:
@@ -77,10 +87,11 @@ class HandEquity:
         if len(available) < cards_per_sim:
             return 0.5
 
+        local_rng = np.random.default_rng(self._query_seed(hand, board, num_players, simulations))
         n_avail = len(available)
         perms = np.empty((simulations, cards_per_sim), dtype=np.int32)
         for i in range(simulations):
-            idx = self.rng.choice(n_avail, size=cards_per_sim, replace=False)
+            idx = local_rng.choice(n_avail, size=cards_per_sim, replace=False)
             perms[i] = available[idx]
         all_deals = perms
 
@@ -164,8 +175,7 @@ class HandEquity:
         try:
             device = self.torch_device if torch.cuda.is_available() and self.torch_device.startswith("cuda") else "cpu"
             gen = torch.Generator(device=device)
-            if self.seed is not None:
-                gen.manual_seed(int(self.seed))
+            gen.manual_seed(self._query_seed(hand, board, num_players, simulations))
             available_tensor = torch.tensor(available, dtype=torch.int64, device=device)
         except Exception:
             return self._estimate_monte_carlo(hand, board, num_players, simulations)

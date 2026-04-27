@@ -38,6 +38,9 @@ class CheckpointManager:
         self.latest_checkpoint_path = None
         self.best_checkpoint_path = None
         self.best_robust_checkpoint_path = None
+        self.latest_policy_checkpoint_path = None
+        self.best_policy_checkpoint_path = None
+        self.best_robust_policy_checkpoint_path = None
         self.resume_checkpoint_path = None
 
     def prepare_run(self):
@@ -71,6 +74,9 @@ class CheckpointManager:
         self.latest_checkpoint_path = self.run_dir / "latest.pt"
         self.best_checkpoint_path = self.run_dir / "best.pt"
         self.best_robust_checkpoint_path = self.run_dir / "best_robust.pt"
+        self.latest_policy_checkpoint_path = self.run_dir / "latest_policy.pt"
+        self.best_policy_checkpoint_path = self.run_dir / "best_policy.pt"
+        self.best_robust_policy_checkpoint_path = self.run_dir / "best_robust_policy.pt"
 
         self._ensure_summary()
         self._write_latest_pointer()
@@ -101,40 +107,100 @@ class CheckpointManager:
 
     def save_checkpoint(self, payload, iteration: int, metrics=None, is_best: bool = False, is_best_robust: bool = False):
         checkpoint_path = self.run_dir / f"iter_{iteration:04d}.pt"
+        policy_checkpoint_path = self.run_dir / f"policy_iter_{iteration:04d}.pt"
+        policy_payload = self._build_policy_payload(payload, iteration=iteration, metrics=metrics)
         torch.save(payload, checkpoint_path)
         torch.save(payload, self.latest_checkpoint_path)
+        torch.save(policy_payload, policy_checkpoint_path)
+        torch.save(policy_payload, self.latest_policy_checkpoint_path)
         if is_best:
             torch.save(payload, self.best_checkpoint_path)
+            torch.save(policy_payload, self.best_policy_checkpoint_path)
         if is_best_robust:
             torch.save(payload, self.best_robust_checkpoint_path)
-        self._update_summary(iteration, metrics or {}, checkpoint_path, is_best=is_best, is_best_robust=is_best_robust)
+            torch.save(policy_payload, self.best_robust_policy_checkpoint_path)
+        self._update_summary(
+            iteration,
+            metrics or {},
+            checkpoint_path,
+            policy_checkpoint_path,
+            is_best=is_best,
+            is_best_robust=is_best_robust,
+        )
         self._write_latest_pointer()
         self._cleanup_old_checkpoints()
         return checkpoint_path
 
+    @staticmethod
+    def _build_policy_payload(payload, iteration: int, metrics=None):
+        return {
+            "checkpoint_type": "policy_snapshot",
+            "trainer_version": payload.get("trainer_version"),
+            "seed": payload.get("seed"),
+            "actions": list(payload.get("actions", [])),
+            "env_config": payload.get("env_config"),
+            "feature_schema": payload.get("feature_schema"),
+            "config": dict(payload.get("config") or {}),
+            "policy_net_state": payload.get("policy_net_state", {}),
+            "source_iteration": int(iteration),
+            "last_metrics": dict(metrics or payload.get("last_metrics") or {}),
+        }
+
+    @staticmethod
+    def _resolve_existing_paths(paths):
+        return {path.resolve() for path in paths if path is not None and path.exists()}
+
+    @staticmethod
+    def _extract_iteration(path: Path):
+        stem = path.stem
+        if stem.startswith("policy_iter_"):
+            suffix = stem[len("policy_iter_"):]
+        elif stem.startswith("iter_"):
+            suffix = stem[len("iter_"):]
+        else:
+            return None
+        try:
+            return int(suffix)
+        except ValueError:
+            return None
+
     def _cleanup_old_checkpoints(self):
         if self.keep_last <= 0:
             return
-        protected = {
+        protected_full = {
             self.latest_checkpoint_path,
             self.best_checkpoint_path,
             self.best_robust_checkpoint_path,
         }
+        protected_policy = {
+            self.latest_policy_checkpoint_path,
+            self.best_policy_checkpoint_path,
+            self.best_robust_policy_checkpoint_path,
+        }
+        protected_full_resolved = self._resolve_existing_paths(protected_full)
+        protected_policy_resolved = self._resolve_existing_paths(protected_policy)
         iter_files = sorted(self.run_dir.glob("iter_*.pt"))
         if len(iter_files) <= self.keep_last:
             return
         for old in iter_files[:-self.keep_last]:
-            if old.resolve() not in {p.resolve() for p in protected if p is not None and p.exists()}:
+            if old.resolve() not in protected_full_resolved:
                 old.unlink(missing_ok=True)
+            iteration = self._extract_iteration(old)
+            if iteration is None:
+                continue
+            old_policy = self.run_dir / f"policy_iter_{iteration:04d}.pt"
+            if old_policy.exists() and old_policy.resolve() not in protected_policy_resolved:
+                old_policy.unlink(missing_ok=True)
 
     def list_snapshot_paths(self, before_iteration=None, limit=None):
-        checkpoint_paths = sorted(self.run_dir.glob("iter_*.pt"))
+        checkpoint_paths = sorted(self.run_dir.glob("policy_iter_*.pt"))
+        if not checkpoint_paths:
+            checkpoint_paths = sorted(self.run_dir.glob("iter_*.pt"))
         snapshots = []
 
         for path in checkpoint_paths:
-            try:
-                iteration = int(path.stem.split("_")[1])
-            except (IndexError, ValueError):
+            iteration = self._extract_iteration(path)
+            if iteration is None:
                 continue
             if before_iteration is not None and iteration >= before_iteration:
                 continue
@@ -182,6 +248,7 @@ class CheckpointManager:
             "best_vs_snapshot_bb_per_100": None,
             "best_vs_population_bb_per_100": None,
             "best_vs_heuristic_bb_per_100": None,
+            "best_vs_heuristic_pool_bb_per_100": None,
             "best_robust_score": None,
             "best_robust_iteration": None,
             "checkpoints": [],
@@ -211,7 +278,7 @@ class CheckpointManager:
         with self.run_summary_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
 
-    def _update_summary(self, iteration, metrics, checkpoint_path, is_best=False, is_best_robust=False):
+    def _update_summary(self, iteration, metrics, checkpoint_path, policy_checkpoint_path, is_best=False, is_best_robust=False):
         summary = self._read_summary()
         summary["latest_iteration"] = max(int(summary.get("latest_iteration", -1)), int(iteration))
 
@@ -220,6 +287,7 @@ class CheckpointManager:
             {
                 "iteration": int(iteration),
                 "path": str(checkpoint_path),
+                "policy_path": str(policy_checkpoint_path),
                 "metrics": metrics,
                 "saved_at": _utc_now(),
             }
@@ -251,6 +319,12 @@ class CheckpointManager:
             current_best_heuristic = summary.get("best_vs_heuristic_bb_per_100")
             if current_best_heuristic is None or vs_heuristic >= current_best_heuristic:
                 summary["best_vs_heuristic_bb_per_100"] = vs_heuristic
+
+        vs_heuristic_pool = metrics.get("vs_heuristic_pool_bb_per_100")
+        if vs_heuristic_pool is not None:
+            current_best_heuristic_pool = summary.get("best_vs_heuristic_pool_bb_per_100")
+            if current_best_heuristic_pool is None or vs_heuristic_pool >= current_best_heuristic_pool:
+                summary["best_vs_heuristic_pool_bb_per_100"] = vs_heuristic_pool
 
         if is_best and summary.get("best_iteration") is None:
             summary["best_iteration"] = int(iteration)

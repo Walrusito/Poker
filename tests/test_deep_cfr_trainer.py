@@ -1,4 +1,7 @@
+import torch
+
 from env.poker_env import PokerEnv
+from models.policy_net import PolicyNet
 from train.train_deep_cfr import DeepCFRTrainer
 from utils.checkpointing import CheckpointManager
 
@@ -61,6 +64,60 @@ def test_multiway_evaluation_reports_all_seats(tmp_path):
     assert snapshot_metrics["pool_size"] == 1
 
 
+def test_evaluation_uses_isolated_env_state(tmp_path):
+    env = PokerEnv(num_players=3, starting_stack=2000, small_blind=10, big_blind=20, reward_unit="bb")
+    trainer = DeepCFRTrainer(
+        env,
+        mc_simulations=8,
+        lut_simulations=8,
+        lut_dir=tmp_path,
+        batch_size=16,
+        regret_epochs=1,
+        policy_epochs=1,
+        seed=15,
+    )
+    initial_hand_index = trainer.env.hand_index
+    initial_button = trainer.env.position.button
+
+    trainer.evaluate_self_play(num_hands=4)
+
+    assert trainer.env.hand_index == initial_hand_index
+    assert trainer.env.position.button == initial_button
+
+
+def test_snapshot_loader_supports_custom_architecture_and_legacy_keys(tmp_path):
+    env = PokerEnv(num_players=2, starting_stack=2000, small_blind=10, big_blind=20, reward_unit="bb")
+    trainer = DeepCFRTrainer(
+        env,
+        mc_simulations=8,
+        lut_simulations=8,
+        lut_dir=tmp_path,
+        batch_size=16,
+        regret_epochs=1,
+        policy_epochs=1,
+        hidden_dim=64,
+        num_layers=3,
+        dropout=0.1,
+        seed=21,
+    )
+    payload = trainer.state_dict()
+    legacy_policy_state = {}
+    for key, value in payload["policy_net_state"].items():
+        legacy_key = key.replace("net.", "_backbone.", 1) if key.startswith("net.") else key
+        legacy_policy_state[legacy_key] = value.clone()
+    payload["policy_net_state"] = legacy_policy_state
+
+    snapshot_path = tmp_path / "snapshot.pt"
+    torch.save(payload, snapshot_path)
+
+    loaded = trainer._load_snapshot_policy(snapshot_path)
+
+    assert isinstance(loaded, PolicyNet)
+    assert loaded.hidden_dim == 64
+    assert loaded.num_layers == 3
+    assert abs(loaded.dropout - 0.1) < 1e-9
+
+
 def test_checkpoint_load_fails_on_feature_schema_mismatch(tmp_path):
     env = PokerEnv(num_players=2, starting_stack=2000, small_blind=10, big_blind=20, reward_unit="bb")
     trainer = DeepCFRTrainer(
@@ -115,6 +172,39 @@ def test_checkpoint_load_fails_on_environment_mismatch(tmp_path):
         assert False, "Expected environment configuration mismatch to raise ValueError"
     except ValueError as exc:
         assert "environment configuration mismatch" in str(exc).lower()
+
+
+def test_checkpoint_load_fails_on_training_config_mismatch(tmp_path):
+    source_env = PokerEnv(num_players=2, starting_stack=2000, small_blind=10, big_blind=20, reward_unit="bb")
+    source_trainer = DeepCFRTrainer(
+        source_env,
+        mc_simulations=8,
+        lut_simulations=8,
+        lut_dir=tmp_path,
+        batch_size=16,
+        regret_epochs=1,
+        policy_epochs=1,
+        seed=19,
+    )
+    payload = source_trainer.state_dict()
+
+    target_env = PokerEnv(num_players=2, starting_stack=2000, small_blind=10, big_blind=20, reward_unit="bb")
+    target_trainer = DeepCFRTrainer(
+        target_env,
+        mc_simulations=8,
+        lut_simulations=8,
+        lut_dir=tmp_path,
+        batch_size=32,
+        regret_epochs=1,
+        policy_epochs=1,
+        seed=19,
+    )
+
+    try:
+        target_trainer.load_checkpoint(payload)
+        assert False, "Expected training configuration mismatch to raise ValueError"
+    except ValueError as exc:
+        assert "training configuration mismatch" in str(exc).lower()
 
 
 def test_exploitability_proxy_is_finite():

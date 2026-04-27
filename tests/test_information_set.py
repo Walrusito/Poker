@@ -138,3 +138,34 @@ def test_information_set_cache_key_distinguishes_button_and_pending_order(tmp_pa
     assert first_features is not second_features
     assert first_features["is_button"] == 1.0
     assert second_features["is_button"] == 0.0
+
+
+def test_information_set_cache_stats_track_vector_and_feature_caches_separately(tmp_path):
+    builder = InformationSetBuilder(mc_simulations=10, lut_simulations=10, lut_dir=tmp_path, seed=23, cache_size=16)
+    state = {
+        "hands": [[card("A", "s"), card("K", "s")], [card("Q", "h"), card("Q", "d")]],
+        "board": [],
+        "pot": 300.0,
+        "bets": [100.0, 200.0],
+        "contributions": [100.0, 200.0],
+        "stacks": [9800.0, 9700.0],
+        "active": [True, True],
+        "street": "preflop",
+        "button": 0,
+        "pending_players": [0, 1],
+        "last_raise_size": 200.0,
+        "last_aggressor": 1,
+        "street_actions": 1,
+        "starting_stack": 10000.0,
+        "big_blind": 100.0,
+        "num_players": 2,
+    }
+
+    builder.encode(state, player=0)
+    builder.encode(state, player=0)
+    builder.encode_vector(state, player=0)
+    stats = builder.get_cache_stats()
+
+    assert stats["feature_dict_cache_hit_rate"] == 0.5
+    assert stats["feature_vector_cache_hit_rate"] == 1.0
+    assert stats["feature_cache_hit_rate"] == stats["feature_vector_cache_hit_rate"]

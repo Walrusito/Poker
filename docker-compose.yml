@@ -51,6 +51,7 @@ services:
       - "${POKER_GRADIENT_CLIP:-1.0}"
       - "--parallel-workers"
       - "${POKER_PARALLEL_WORKERS:-1}"
+      - "${POKER_DISABLE_DETERMINISTIC_PARALLEL:-}"
       - "--dataloader-workers"
       - "${POKER_DATALOADER_WORKERS:-2}"
       - "--torch-num-threads"
@@ -62,6 +63,14 @@ services:
       # Example: POKER_USE_TORCH_COMPILE=--use-torch-compile
       - "${POKER_USE_AMP:-}"
       - "${POKER_USE_TORCH_COMPILE:-}"
+      - "${POKER_DISABLE_REACH_WEIGHTING:-}"
+      - "--reach-weight-mode"
+      - "${POKER_REACH_WEIGHT_MODE:-linear}"
+      - "--reach-weight-clip"
+      - "${POKER_REACH_WEIGHT_CLIP:-100.0}"
+      - "${POKER_DISABLE_REACH_AUTO_CLIP:-}"
+      - "--reach-auto-clip-quantile"
+      - "${POKER_REACH_AUTO_CLIP_QUANTILE:-0.95}"
       - "--snapshot-pool-size"
       - "${POKER_SNAPSHOT_POOL_SIZE:-4}"
       - "--max-snapshot-cache"
@@ -131,6 +140,6 @@ services:
     ports:
       - "5000:5000"
     command: >
-      sh -c "pip install mlflow --quiet &&
+      sh -c "pip install mlflow==2.12.2 --quiet &&
              mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri file:/app/mlruns"
     restart: unless-stopped

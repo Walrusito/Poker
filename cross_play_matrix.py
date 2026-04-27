@@ -43,7 +43,10 @@ def select_runs(args):
 
     selected = []
     for summary in summaries:
-        checkpoint_path = summary["best_checkpoint"] if args.checkpoint_name == "best.pt" else summary["latest_checkpoint"]
+        if args.checkpoint_name == "best.pt":
+            checkpoint_path = summary.get("best_policy_checkpoint") or summary["best_checkpoint"]
+        else:
+            checkpoint_path = summary.get("latest_policy_checkpoint") or summary["latest_checkpoint"]
         if not checkpoint_path or not Path(checkpoint_path).exists():
             continue
         selected.append({"run_name": summary["run_name"], "checkpoint_path": checkpoint_path})
@@ -52,8 +55,12 @@ def select_runs(args):
 
 def load_policy(checkpoint_path, input_dim, output_dim, device):
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = PolicyNet(input_dim=input_dim, output_dim=output_dim).to(device)
-    model.load_state_dict(payload["policy_net_state"])
+    model = PolicyNet.from_checkpoint_payload(
+        payload,
+        input_dim=input_dim,
+        output_dim=output_dim,
+        device=device,
+    )
     model.eval()
     return model
 

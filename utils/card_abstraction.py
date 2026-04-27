@@ -41,7 +41,13 @@ class CardAbstraction:
                 self.cache.move_to_end(key)
                 return self.cache[key]
             self._cache_misses += 1
-            value = self.equity_provider.estimate(hand, board, num_players=num_players)
+
+        value = self.equity_provider.estimate(hand, board, num_players=num_players)
+
+        with self._lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
             self.cache[key] = value
             if len(self.cache) > self.max_cache_size:
                 self.cache.popitem(last=False)

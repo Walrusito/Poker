@@ -59,8 +59,10 @@ class InformationSetBuilder:
         self.cache_size = max(0, int(cache_size))
         self._vector_cache = OrderedDict()
         self._feature_cache = OrderedDict()
-        self._cache_hits = 0
-        self._cache_misses = 0
+        self._vector_cache_hits = 0
+        self._vector_cache_misses = 0
+        self._feature_cache_hits = 0
+        self._feature_cache_misses = 0
         self._lock = threading.RLock()
 
         self.feature_schema = {
@@ -75,10 +77,16 @@ class InformationSetBuilder:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def get_cache_stats(self):
-        total = self._cache_hits + self._cache_misses
+        vector_total = self._vector_cache_hits + self._vector_cache_misses
+        feature_total = self._feature_cache_hits + self._feature_cache_misses
+        vector_hit_rate = self._vector_cache_hits / max(1, vector_total)
+        feature_hit_rate = self._feature_cache_hits / max(1, feature_total)
         return {
-            "feature_cache_hit_rate": self._cache_hits / max(1, total),
+            "feature_cache_hit_rate": vector_hit_rate,
+            "feature_vector_cache_hit_rate": vector_hit_rate,
             "feature_cache_size": len(self._vector_cache),
+            "feature_dict_cache_hit_rate": feature_hit_rate,
+            "feature_dict_cache_size": len(self._feature_cache),
         }
 
     @staticmethod
@@ -135,14 +143,20 @@ class InformationSetBuilder:
 
         return h
 
-    def _cache_lookup(self, cache, cache_key):
+    def _cache_lookup(self, cache_name, cache, cache_key):
         with self._lock:
             cached = cache.get(cache_key)
             if cached is not None:
                 cache.move_to_end(cache_key)
-                self._cache_hits += 1
+                if cache_name == "vector":
+                    self._vector_cache_hits += 1
+                else:
+                    self._feature_cache_hits += 1
             else:
-                self._cache_misses += 1
+                if cache_name == "vector":
+                    self._vector_cache_misses += 1
+                else:
+                    self._feature_cache_misses += 1
             return cached
 
     def _store_cached_payload(self, cache_key, vector, feature_map):
@@ -248,7 +262,7 @@ class InformationSetBuilder:
     def encode_vector(self, state, player=0):
         cache_key = self._state_key(state, player)
         if cache_key is not None:
-            cached_vector = self._cache_lookup(self._vector_cache, cache_key)
+            cached_vector = self._cache_lookup("vector", self._vector_cache, cache_key)
             if cached_vector is not None:
                 return cached_vector
 
@@ -306,7 +320,7 @@ class InformationSetBuilder:
     def encode(self, state, player=0):
         cache_key = self._state_key(state, player)
         if cache_key is not None:
-            cached_features = self._cache_lookup(self._feature_cache, cache_key)
+            cached_features = self._cache_lookup("feature", self._feature_cache, cache_key)
             if cached_features is not None:
                 return cached_features
 

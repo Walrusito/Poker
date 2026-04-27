@@ -10,7 +10,7 @@ from env.poker_env import PokerEnv
 from train.train_deep_cfr import DeepCFRTrainer
 from utils.checkpointing import CheckpointManager
 from utils.command_persistence import persist_run_command
-from utils.logging import end_experiment, log_artifact, log_metrics_batch, log_param, start_experiment_run
+from utils.logging import end_experiment, log_artifact, log_param, set_run_tags, start_experiment_run
 
 
 def parse_args():
@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--policy-epochs", type=int, default=1, help="Gradient epochs for the policy network per iteration (was 2; fewer epochs prevents entropy collapse)")
     parser.add_argument("--gradient-clip", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument("--parallel-workers", type=int, default=1, help="Parallel workers for self-play episode collection and rollout evaluation")
+    parser.add_argument("--disable-deterministic-parallel", action="store_true", help="Allow non-deterministic merge/order in parallel workers")
     parser.add_argument("--dataloader-workers", type=int, default=2, help="DataLoader workers for policy/regret training")
     parser.add_argument("--torch-num-threads", type=int, default=16, help="CPU threads used by Torch ops")
     parser.add_argument("--require-cuda", action="store_true", help="Fail fast if CUDA is not available")
@@ -56,6 +57,11 @@ def parse_args():
     parser.add_argument("--torch-equity-device", type=str, default="cuda", help="Torch device for equity sampling backend")
     parser.add_argument("--use-amp", action="store_true", help="Enable mixed precision (CUDA only)")
     parser.add_argument("--use-torch-compile", action="store_true", help="Enable torch.compile for nets (PyTorch 2.x)")
+    parser.add_argument("--disable-reach-weighting", action="store_true", help="Disable CFR-style reach/counterfactual sample weighting")
+    parser.add_argument("--reach-weight-clip", type=float, default=100.0, help="Upper bound for reach-based sample weights")
+    parser.add_argument("--reach-weight-mode", type=str, default="linear", choices=["linear", "sqrt"], help="Transform for CFR reach weights")
+    parser.add_argument("--disable-reach-auto-clip", action="store_true", help="Disable automatic quantile-based reach-weight clipping")
+    parser.add_argument("--reach-auto-clip-quantile", type=float, default=0.95, help="Quantile used to estimate effective reach-weight clip")
     parser.add_argument("--snapshot-pool-size", type=int, default=4, help="How many historical checkpoints to use when evaluating against snapshot opponents")
     parser.add_argument("--max-snapshot-cache", type=int, default=8, help="How many snapshot policies to cache in memory")
     parser.add_argument("--population-run-limit", type=int, default=6, help="How many external runs to include in the population opponent pool")
@@ -128,6 +134,91 @@ def configure_torch_runtime(torch_num_threads: int, require_cuda: bool = False):
         print(f"[Runtime] cuda_version={torch.version.cuda} device={torch.cuda.get_device_name(0)}")
 
 
+def build_mlflow_params(args, run_context):
+    return {
+        "players": args.players,
+        "starting_stack": args.starting_stack,
+        "small_blind": args.small_blind,
+        "big_blind": args.big_blind,
+        "mc_simulations": args.mc_simulations,
+        "lut_simulations": args.lut_simulations,
+        "street_bet_multipliers": args.street_bet_multipliers,
+        "street_raise_multipliers": args.street_raise_multipliers,
+        "rollouts_per_action": args.rollouts_per_action,
+        "batch_size": args.batch_size,
+        "regret_epochs": args.regret_epochs,
+        "policy_epochs": args.policy_epochs,
+        "gradient_clip": args.gradient_clip,
+        "snapshot_pool_size": args.snapshot_pool_size,
+        "population_run_limit": args.population_run_limit,
+        "population_checkpoint_name": args.population_checkpoint_name,
+        "population_mix_prob": args.population_mix_prob,
+        "policy_smoothing_alpha": args.policy_smoothing_alpha,
+        "entropy_regularization": args.entropy_regularization,
+        "seed": args.seed,
+        "deterministic": int(args.deterministic),
+        "num_layers": args.num_layers,
+        "hidden_dim": args.hidden_dim,
+        "dropout": args.dropout,
+        "use_reach_weighting": int(not args.disable_reach_weighting),
+        "reach_weight_mode": args.reach_weight_mode,
+        "reach_weight_clip": args.reach_weight_clip,
+        "reach_weight_auto_clip": int(not args.disable_reach_auto_clip),
+        "reach_weight_auto_quantile": args.reach_auto_clip_quantile,
+        "run_name": run_context["run_name"],
+    }
+
+
+def build_mlflow_tags(args, run_context, command):
+    return {
+        "poker.resume_mode": args.resume_mode,
+        "poker.resumed_from_checkpoint": int(run_context["is_resumed"]),
+        "poker.run_dir": run_context["run_dir"],
+        "poker.command_file": args.command_file,
+        "poker.command": command,
+        "poker.iterations_target": args.iterations,
+        "poker.episodes_per_iteration": args.episodes,
+        "poker.eval_hands": args.eval_hands,
+        "poker.eval_random_hands": args.eval_random_hands,
+        "poker.eval_snapshot_hands": args.eval_snapshot_hands,
+        "poker.eval_population_hands": args.eval_population_hands,
+        "poker.eval_heuristic_hands": args.eval_heuristic_hands,
+        "poker.lut_dir": args.lut_dir,
+        "poker.feature_cache_size": args.feature_cache_size,
+        "poker.parallel_workers": args.parallel_workers,
+        "poker.deterministic_parallel": int(not args.disable_deterministic_parallel),
+        "poker.dataloader_workers": args.dataloader_workers,
+        "poker.torch_num_threads": args.torch_num_threads,
+        "poker.require_cuda": int(args.require_cuda),
+        "poker.rollout_batch_size": args.rollout_batch_size,
+        "poker.use_torch_equity": int(args.use_torch_equity),
+        "poker.torch_equity_device": args.torch_equity_device,
+        "poker.use_amp": int(args.use_amp),
+        "poker.use_torch_compile": int(args.use_torch_compile),
+        "poker.use_reach_weighting": int(not args.disable_reach_weighting),
+        "poker.reach_weight_mode": args.reach_weight_mode,
+        "poker.reach_weight_clip": args.reach_weight_clip,
+        "poker.reach_weight_auto_clip": int(not args.disable_reach_auto_clip),
+        "poker.reach_weight_auto_quantile": args.reach_auto_clip_quantile,
+        "poker.max_snapshot_cache": args.max_snapshot_cache,
+        "poker.checkpoint_interval": args.checkpoint_interval,
+        "poker.early_stop_patience": args.early_stop_patience,
+        "poker.early_stop_min_iters": args.early_stop_min_iters,
+        "poker.early_stop_entropy_floor": args.early_stop_entropy_floor,
+        "poker.early_stop_entropy_patience": args.early_stop_entropy_patience,
+        "poker.early_stop_regret_loss_ceiling": args.early_stop_regret_loss_ceiling,
+        "poker.early_stop_policy_loss_ceiling": args.early_stop_policy_loss_ceiling,
+        "poker.checkpoint_dir": args.checkpoint_dir,
+        "poker.checkpoint_keep_last": args.checkpoint_keep_last,
+    }
+
+
+def log_mlflow_configuration(args, run_context, command):
+    for name, value in build_mlflow_params(args, run_context).items():
+        log_param(name, value)
+    set_run_tags(build_mlflow_tags(args, run_context, command))
+
+
 def main():
     args = parse_args()
     street_bet_multipliers = parse_street_multipliers(args.street_bet_multipliers)
@@ -170,6 +261,7 @@ def main():
         policy_epochs=args.policy_epochs,
         grad_clip=args.gradient_clip,
         parallel_workers=args.parallel_workers,
+        deterministic_parallel=(not args.disable_deterministic_parallel),
         snapshot_pool_size=args.snapshot_pool_size,
         max_snapshot_cache=args.max_snapshot_cache,
         population_run_limit=args.population_run_limit,
@@ -185,6 +277,11 @@ def main():
         torch_equity_device=args.torch_equity_device,
         use_amp=args.use_amp,
         use_torch_compile=args.use_torch_compile,
+        use_reach_weighting=(not args.disable_reach_weighting),
+        reach_weight_mode=args.reach_weight_mode,
+        reach_weight_clip=args.reach_weight_clip,
+        reach_weight_auto_clip=(not args.disable_reach_auto_clip),
+        reach_weight_auto_quantile=args.reach_auto_clip_quantile,
         num_layers=args.num_layers,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
@@ -209,86 +306,47 @@ def main():
         run_name=run_context["run_name"],
         run_id=mlflow_run_id,
     )
-    if started_run_id is not None:
-        checkpoint_manager.set_mlflow_run_id(started_run_id)
+    checkpoint_manager.set_mlflow_run_id(started_run_id)
 
-    log_param("players", args.players)
-    log_param("starting_stack", args.starting_stack)
-    log_param("small_blind", args.small_blind)
-    log_param("big_blind", args.big_blind)
-    log_param("mc_simulations", args.mc_simulations)
-    log_param("lut_simulations", args.lut_simulations)
-    log_param("lut_dir", args.lut_dir)
-    log_param("street_bet_multipliers", args.street_bet_multipliers)
-    log_param("street_raise_multipliers", args.street_raise_multipliers)
-    log_param("eval_random_hands", args.eval_random_hands)
-    log_param("eval_snapshot_hands", args.eval_snapshot_hands)
-    log_param("eval_population_hands", args.eval_population_hands)
-    log_param("eval_heuristic_hands", args.eval_heuristic_hands)
-    log_param("rollouts_per_action", args.rollouts_per_action)
-    log_param("feature_cache_size", args.feature_cache_size)
-    log_param("batch_size", args.batch_size)
-    log_param("regret_epochs", args.regret_epochs)
-    log_param("policy_epochs", args.policy_epochs)
-    log_param("gradient_clip", args.gradient_clip)
-    log_param("parallel_workers", args.parallel_workers)
-    log_param("dataloader_workers", args.dataloader_workers)
-    log_param("torch_num_threads", args.torch_num_threads)
-    log_param("require_cuda", int(args.require_cuda))
-    log_param("rollout_batch_size", args.rollout_batch_size)
-    log_param("use_torch_equity", int(args.use_torch_equity))
-    log_param("torch_equity_device", args.torch_equity_device)
-    log_param("use_amp", int(args.use_amp))
-    log_param("use_torch_compile", int(args.use_torch_compile))
-    log_param("snapshot_pool_size", args.snapshot_pool_size)
-    log_param("max_snapshot_cache", args.max_snapshot_cache)
-    log_param("population_run_limit", args.population_run_limit)
-    log_param("population_checkpoint_name", args.population_checkpoint_name)
-    log_param("population_mix_prob", args.population_mix_prob)
-    log_param("policy_smoothing_alpha", args.policy_smoothing_alpha)
-    log_param("entropy_regularization", args.entropy_regularization)
-    log_param("checkpoint_interval", args.checkpoint_interval)
-    log_param("early_stop_patience", args.early_stop_patience)
-    log_param("early_stop_min_iters", args.early_stop_min_iters)
-    log_param("early_stop_entropy_floor", args.early_stop_entropy_floor)
-    log_param("early_stop_entropy_patience", args.early_stop_entropy_patience)
-    log_param("early_stop_regret_loss_ceiling", args.early_stop_regret_loss_ceiling)
-    log_param("early_stop_policy_loss_ceiling", args.early_stop_policy_loss_ceiling)
-    log_param("checkpoint_dir", args.checkpoint_dir)
-    log_param("run_name", run_context["run_name"])
-    log_param("run_dir", run_context["run_dir"])
-    log_param("resume_mode", args.resume_mode)
-    log_param("resumed_from_checkpoint", int(run_context["is_resumed"]))
-    log_param("seed", args.seed)
-    log_param("deterministic", int(args.deterministic))
-    log_param("checkpoint_keep_last", args.checkpoint_keep_last)
-    log_param("num_layers", args.num_layers)
-    log_param("hidden_dim", args.hidden_dim)
-    log_param("dropout", args.dropout)
-    log_param("command_file", args.command_file)
-    log_param("docker_command", command)
+    run_status = "FAILED"
+    try:
+        log_mlflow_configuration(args, run_context, command)
 
-    trainer.train(
-        iterations=args.iterations,
-        episodes=args.episodes,
-        eval_hands=args.eval_hands,
-        eval_random_hands=args.eval_random_hands,
-        eval_snapshot_hands=args.eval_snapshot_hands,
-        eval_population_hands=args.eval_population_hands,
-        eval_heuristic_hands=args.eval_heuristic_hands,
-        early_stop_patience=args.early_stop_patience,
-        early_stop_min_iters=args.early_stop_min_iters,
-        early_stop_entropy_floor=args.early_stop_entropy_floor,
-        early_stop_entropy_patience=args.early_stop_entropy_patience,
-        early_stop_regret_loss_ceiling=args.early_stop_regret_loss_ceiling,
-        early_stop_policy_loss_ceiling=args.early_stop_policy_loss_ceiling,
-    )
+        trainer.train(
+            iterations=args.iterations,
+            episodes=args.episodes,
+            eval_hands=args.eval_hands,
+            eval_random_hands=args.eval_random_hands,
+            eval_snapshot_hands=args.eval_snapshot_hands,
+            eval_population_hands=args.eval_population_hands,
+            eval_heuristic_hands=args.eval_heuristic_hands,
+            early_stop_patience=args.early_stop_patience,
+            early_stop_min_iters=args.early_stop_min_iters,
+            early_stop_entropy_floor=args.early_stop_entropy_floor,
+            early_stop_entropy_patience=args.early_stop_entropy_patience,
+            early_stop_regret_loss_ceiling=args.early_stop_regret_loss_ceiling,
+            early_stop_policy_loss_ceiling=args.early_stop_policy_loss_ceiling,
+        )
 
-    if checkpoint_manager.run_summary_path is not None and checkpoint_manager.run_summary_path.exists():
-        log_artifact(str(checkpoint_manager.run_summary_path))
+        if checkpoint_manager.run_summary_path is not None and checkpoint_manager.run_summary_path.exists():
+            log_artifact(str(checkpoint_manager.run_summary_path))
 
-    end_experiment()
-    print("Training complete.")
+        set_run_tags({"poker.run_status": "finished"})
+        run_status = "FINISHED"
+        print("Training complete.")
+    except Exception as exc:
+        try:
+            set_run_tags(
+                {
+                    "poker.run_status": "failed",
+                    "poker.failure_type": type(exc).__name__,
+                }
+            )
+        except Exception as tag_exc:
+            print(f"[MLFLOW WARNING] failed to tag run failure metadata: {tag_exc}")
+        raise
+    finally:
+        end_experiment(status=run_status)
 
 
 if __name__ == "__main__":

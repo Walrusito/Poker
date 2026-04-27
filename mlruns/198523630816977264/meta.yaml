@@ -1,6 +1,0 @@
-artifact_location: file:///app/mlruns/198523630816977264
-creation_time: 1777252756356
-experiment_id: '198523630816977264'
-last_update_time: 1777252756356
-lifecycle_stage: active
-name: poker_cfr_ai_gpu_3060_stable_v2

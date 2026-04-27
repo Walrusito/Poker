@@ -33,3 +33,28 @@ def test_checkpoint_manager_tracks_best_robust_checkpoint(tmp_path):
     assert manager.best_robust_checkpoint_path.exists()
     assert summary["best_robust_score"] == 2.5
     assert summary["best_robust_iteration"] == 1
+
+
+def test_checkpoint_manager_writes_lightweight_policy_snapshots(tmp_path):
+    manager = CheckpointManager(root_dir=tmp_path, experiment="exp_test", run_name="run_a", resume_mode="never", seed=17)
+    manager.prepare_run()
+    payload = {
+        "trainer_version": 6,
+        "seed": 17,
+        "actions": ["fold", "call"],
+        "env_config": {"num_players": 2},
+        "feature_schema": {"fingerprint": "abc"},
+        "config": {"input_dim": 31, "output_dim": 2, "hidden_dim": 32, "num_layers": 2, "dropout": 0.0},
+        "policy_net_state": {},
+        "regret_net_state": {},
+    }
+
+    manager.save_checkpoint(payload, iteration=1, metrics={"vs_random_bb_per_100": 3.5}, is_best=True, is_best_robust=True)
+
+    snapshot_paths = manager.list_snapshot_paths(limit=1)
+
+    assert manager.latest_policy_checkpoint_path.exists()
+    assert manager.best_policy_checkpoint_path.exists()
+    assert manager.best_robust_policy_checkpoint_path.exists()
+    assert snapshot_paths
+    assert snapshot_paths[0].name == "policy_iter_0001.pt"

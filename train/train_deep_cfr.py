@@ -1,6 +1,7 @@
 import copy
 import math
 import random
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -38,9 +39,40 @@ class DeepCFRTrainer:
         "policy_loss",
         "avg_policy_entropy",
         "avg_abs_regret",
+        "br_gap_proxy",
+        "reach_weight_clip_optimal",
         "self_play_showdown_rate",
         "lut_hit_rate",
         "equity_avg_ms",
+    )
+    CHECKPOINT_HISTORY_KEYS = (
+        "robust_score",
+        "exploitability_proxy",
+        "vs_random_bb_per_100",
+        "vs_snapshot_bb_per_100",
+        "vs_population_bb_per_100",
+        "vs_heuristic_bb_per_100",
+        "vs_heuristic_pool_bb_per_100",
+        "avg_policy_entropy",
+        "regret_loss",
+        "policy_loss",
+    )
+    RESUME_VALIDATION_CONFIG_KEYS = (
+        "rollout_samples_per_action",
+        "batch_size",
+        "regret_epochs",
+        "policy_epochs",
+        "grad_clip",
+        "policy_smoothing_alpha",
+        "entropy_regularization",
+        "population_mix_prob",
+        "mc_simulations",
+        "lut_simulations",
+        "use_reach_weighting",
+        "reach_weight_mode",
+        "reach_weight_clip",
+        "reach_weight_auto_clip",
+        "reach_weight_auto_quantile",
     )
 
     def __init__(
@@ -72,6 +104,12 @@ class DeepCFRTrainer:
         torch_equity_device: str = "cuda",
         use_amp: bool = True,
         use_torch_compile: bool = False,
+        use_reach_weighting: bool = True,
+        reach_weight_mode: str = "linear",
+        reach_weight_clip: float = 100.0,
+        reach_weight_auto_clip: bool = True,
+        reach_weight_auto_quantile: float = 0.95,
+        deterministic_parallel: bool = True,
         num_layers: int = 2,
         hidden_dim: int = 128,
         dropout: float = 0.0,
@@ -114,19 +152,33 @@ class DeepCFRTrainer:
         self.use_torch_equity = bool(use_torch_equity)
         self.torch_equity_device = torch_equity_device
         self.use_amp = bool(use_amp) and (self.device.type == "cuda")
+        self.use_reach_weighting = bool(use_reach_weighting)
+        normalized_mode = str(reach_weight_mode).strip().lower()
+        self.reach_weight_mode = normalized_mode if normalized_mode in {"linear", "sqrt"} else "linear"
+        self.reach_weight_clip = max(1.0, float(reach_weight_clip))
+        self.reach_weight_auto_clip = bool(reach_weight_auto_clip)
+        self.reach_weight_auto_quantile = min(0.999, max(0.50, float(reach_weight_auto_quantile)))
+        self.effective_reach_weight_clip = self.reach_weight_clip
+        self._reach_weight_observations = []
+        self.deterministic_parallel = bool(deterministic_parallel)
+        self.num_layers = max(1, int(num_layers))
+        self.hidden_dim = max(1, int(hidden_dim))
+        self.dropout = max(0.0, float(dropout))
         # torch.compile + multi-threaded inference can trigger Dynamo/Fx tracing conflicts.
         # We disable compile in that configuration for stability.
         requested_compile = bool(use_torch_compile)
         self.use_torch_compile = requested_compile and (self.parallel_workers <= 1)
         self.rng = np.random.default_rng(seed)
+        self._rng_lock = threading.Lock()
+        self._snapshot_cache_lock = threading.RLock()
 
         self.regret_net = RegretNet(
-            input_dim=self.input_dim, hidden_dim=hidden_dim,
-            output_dim=self.num_actions, num_layers=num_layers, dropout=dropout,
+            input_dim=self.input_dim, hidden_dim=self.hidden_dim,
+            output_dim=self.num_actions, num_layers=self.num_layers, dropout=self.dropout,
         ).to(self.device)
         self.policy_net = PolicyNet(
-            input_dim=self.input_dim, hidden_dim=hidden_dim,
-            output_dim=self.num_actions, num_layers=num_layers, dropout=dropout,
+            input_dim=self.input_dim, hidden_dim=self.hidden_dim,
+            output_dim=self.num_actions, num_layers=self.num_layers, dropout=self.dropout,
         ).to(self.device)
         if requested_compile and not self.use_torch_compile:
             print("[Runtime] torch.compile disabled (parallel_workers>1).")
@@ -213,9 +265,83 @@ class DeepCFRTrainer:
                 + "; ".join(mismatches)
             )
 
+    def _policy_arch_config(self):
+        return {
+            "input_dim": int(self.input_dim),
+            "output_dim": int(self.num_actions),
+            "hidden_dim": int(self.hidden_dim),
+            "num_layers": int(self.num_layers),
+            "dropout": float(self.dropout),
+        }
+
+    def _resume_validation_config(self):
+        return {
+            "rollout_samples_per_action": int(self.rollout_samples_per_action),
+            "batch_size": int(self.batch_size),
+            "regret_epochs": int(self.regret_epochs),
+            "policy_epochs": int(self.policy_epochs),
+            "grad_clip": float(self.grad_clip),
+            "policy_smoothing_alpha": float(self.policy_smoothing_alpha),
+            "entropy_regularization": float(self.entropy_regularization),
+            "population_mix_prob": float(self.population_mix_prob),
+            "mc_simulations": int(self.equity_lut.fallback_equity.simulations),
+            "lut_simulations": int(self.equity_lut.lut_equity.simulations),
+            "use_reach_weighting": int(self.use_reach_weighting),
+            "reach_weight_mode": self.reach_weight_mode,
+            "reach_weight_clip": float(self.reach_weight_clip),
+            "reach_weight_auto_clip": int(self.reach_weight_auto_clip),
+            "reach_weight_auto_quantile": float(self.reach_weight_auto_quantile),
+        }
+
+    @classmethod
+    def _validate_resume_config(cls, current_config, checkpoint_config):
+        if checkpoint_config is None:
+            return
+
+        mismatches = []
+        for key in cls.RESUME_VALIDATION_CONFIG_KEYS:
+            checkpoint_value = checkpoint_config.get(key)
+            if checkpoint_value is None:
+                continue
+            current_value = current_config.get(key)
+            if current_value != checkpoint_value:
+                mismatches.append(
+                    f"{key}: current={current_value!r} checkpoint={checkpoint_value!r}"
+                )
+
+        if mismatches:
+            raise ValueError(
+                "Checkpoint training configuration mismatch. "
+                + "; ".join(mismatches)
+            )
+
+    @classmethod
+    def _compact_metrics_entry(cls, iteration_number, metrics):
+        entry = {"iteration": int(iteration_number)}
+        for key in cls.CHECKPOINT_HISTORY_KEYS:
+            value = metrics.get(key)
+            if value is not None:
+                entry[key] = value
+        return entry
+
+    def _make_isolated_env(self, seed=None):
+        bet_sizing = getattr(self.env, "bet_sizing", None)
+        env_cls = self.env.__class__
+        return env_cls(
+            num_players=int(self.env.num_players),
+            starting_stack=float(self.env.starting_stack),
+            small_blind=float(self.env.small_blind),
+            big_blind=float(self.env.big_blind),
+            reward_unit=self.env.reward_unit,
+            street_bet_multipliers=copy.deepcopy(getattr(bet_sizing, "street_bet_multipliers", None)),
+            street_raise_multipliers=copy.deepcopy(getattr(bet_sizing, "street_raise_multipliers", None)),
+            seed=self.seed if seed is None else int(seed),
+        )
+
     def state_dict(self):
         return {
-            "trainer_version": 4,
+            "trainer_version": 6,
+            "checkpoint_type": "full",
             "seed": self.seed,
             "completed_iterations": self.completed_iterations,
             "best_vs_random_bb_per_100": self.best_vs_random_bb_per_100,
@@ -226,7 +352,6 @@ class DeepCFRTrainer:
             "torch_rng_state": torch.get_rng_state(),
             "torch_cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "actions": list(self.actions),
-            "env_state": copy.deepcopy(self.env),
             "env_config": self._env_config_snapshot(self.env),
             "regret_net_state": self.regret_net.state_dict(),
             "policy_net_state": self.policy_net.state_dict(),
@@ -262,6 +387,20 @@ class DeepCFRTrainer:
                 "torch_equity_device": self.torch_equity_device,
                 "use_amp": int(self.use_amp),
                 "use_torch_compile": int(self.use_torch_compile),
+                "feature_cache_size": self.iss.cache_size,
+                "mc_simulations": int(self.equity_lut.fallback_equity.simulations),
+                "lut_simulations": int(self.equity_lut.lut_equity.simulations),
+                "use_reach_weighting": int(self.use_reach_weighting),
+                "reach_weight_mode": self.reach_weight_mode,
+                "reach_weight_clip": float(self.reach_weight_clip),
+                "reach_weight_auto_clip": int(self.reach_weight_auto_clip),
+                "reach_weight_auto_quantile": float(self.reach_weight_auto_quantile),
+                "deterministic_parallel": int(self.deterministic_parallel),
+                "input_dim": self.input_dim,
+                "output_dim": self.num_actions,
+                "hidden_dim": self.hidden_dim,
+                "num_layers": self.num_layers,
+                "dropout": self.dropout,
             },
             "feature_schema": dict(self.iss.feature_schema),
         }
@@ -281,6 +420,17 @@ class DeepCFRTrainer:
                     "Start a new run/checkpoint set for this feature-space version."
                 )
         self._validate_resume_env(self._env_config_snapshot(self.env), checkpoint_env_config)
+        checkpoint_config = dict(payload.get("config") or {})
+        self._validate_resume_config(self._resume_validation_config(), checkpoint_config)
+        for key, current_value in self._policy_arch_config().items():
+            checkpoint_value = checkpoint_config.get(key)
+            if checkpoint_value is None:
+                continue
+            if checkpoint_value != current_value:
+                raise ValueError(
+                    "Checkpoint policy architecture mismatch. "
+                    f"{key}: current={current_value!r} checkpoint={checkpoint_value!r}"
+                )
 
         self.regret_net.load_state_dict(payload["regret_net_state"])
         self.policy_net.load_state_dict(payload["policy_net_state"])
@@ -333,7 +483,16 @@ class DeepCFRTrainer:
         )
 
     def _next_seed(self):
-        return int(self.rng.integers(0, 2**32 - 1))
+        with self._rng_lock:
+            return int(self.rng.integers(0, 2**32 - 1))
+
+    def _spawn_rng(self, seed=None):
+        base_seed = self._next_seed() if seed is None else int(seed)
+        return np.random.default_rng(base_seed)
+
+    @staticmethod
+    def _child_seed(master_rng):
+        return int(master_rng.integers(0, 2**32 - 1))
 
     def _refresh_population_pool(self):
         if self.checkpoint_manager is None or self.population_run_limit <= 0:
@@ -380,6 +539,9 @@ class DeepCFRTrainer:
             "entropy_total": 0.0,
             "regret_abs_total": 0.0,
             "regret_count": 0,
+            "reach_cf_weight_total": 0.0,
+            "reach_policy_weight_total": 0.0,
+            "reach_weight_count": 0,
         }
 
     def _reset_traversal_stats(self):
@@ -392,11 +554,14 @@ class DeepCFRTrainer:
     def _summarize_traversal_stats(self):
         visited_nodes = max(1, self._traversal_stats["visited_nodes"])
         regret_count = max(1, self._traversal_stats["regret_count"])
+        reach_weight_count = max(1, self._traversal_stats["reach_weight_count"])
         return {
             "visited_nodes": self._traversal_stats["visited_nodes"],
             "avg_branching_factor": self._traversal_stats["legal_action_total"] / visited_nodes,
             "avg_policy_entropy": self._traversal_stats["entropy_total"] / visited_nodes,
             "avg_abs_regret": self._traversal_stats["regret_abs_total"] / regret_count,
+            "reach_cf_weight_mean": self._traversal_stats["reach_cf_weight_total"] / reach_weight_count,
+            "reach_policy_weight_mean": self._traversal_stats["reach_policy_weight_total"] / reach_weight_count,
         }
 
     def _legal_mask(self, legal_actions):
@@ -584,7 +749,15 @@ class DeepCFRTrainer:
         advantage_records = []
         policy_records = []
         local_stats = self._empty_stats()
-        self._traverse(episode_env, advantage_records, policy_records, local_stats, local_rng)
+        initial_reach = np.ones(episode_env.num_players, dtype=np.float64)
+        self._traverse(
+            episode_env,
+            advantage_records,
+            policy_records,
+            local_stats,
+            local_rng,
+            initial_reach,
+        )
         return advantage_records, policy_records, local_stats
 
     def self_play(self, episodes: int = 50):
@@ -601,25 +774,31 @@ class DeepCFRTrainer:
 
         if self.parallel_workers > 1 and len(episode_envs) > 1:
             max_workers = min(self.parallel_workers, len(episode_envs))
-            results = []
-            executor = ThreadPoolExecutor(max_workers=max_workers)
-            futures = []
-            try:
-                for env_snapshot, seed in zip(episode_envs, seeds):
-                    futures.append(executor.submit(self._collect_episode, env_snapshot, seed))
-                completed = 0
-                for fut in as_completed(futures):
-                    results.append(fut.result())
-                    completed += 1
-                    if completed % progress_every == 0 or completed == episodes:
-                        print(f"[DeepCFR] self-play progress: {completed}/{episodes} episodes")
-            except KeyboardInterrupt:
-                for fut in futures:
-                    fut.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
-            finally:
-                executor.shutdown(wait=True, cancel_futures=True)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                if self.deterministic_parallel:
+                    iterator = executor.map(self._collect_episode, episode_envs, seeds)
+                    results = []
+                    for idx, result in enumerate(iterator, start=1):
+                        results.append(result)
+                        if idx % progress_every == 0 or idx == episodes:
+                            print(f"[DeepCFR] self-play progress: {idx}/{episodes} episodes")
+                else:
+                    results = []
+                    futures = []
+                    try:
+                        for env_snapshot, seed in zip(episode_envs, seeds):
+                            futures.append(executor.submit(self._collect_episode, env_snapshot, seed))
+                        completed = 0
+                        for fut in as_completed(futures):
+                            results.append(fut.result())
+                            completed += 1
+                            if completed % progress_every == 0 or completed == episodes:
+                                print(f"[DeepCFR] self-play progress: {completed}/{episodes} episodes")
+                    except KeyboardInterrupt:
+                        for fut in futures:
+                            fut.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise
         else:
             results = []
             for idx, (env_snapshot, seed) in enumerate(zip(episode_envs, seeds), start=1):
@@ -656,7 +835,67 @@ class DeepCFRTrainer:
 
         return action_values
 
-    def _traverse(self, env, advantage_records, policy_records, stats, rng):
+    def _weighted_mean(self, values: torch.Tensor, weights: torch.Tensor):
+        safe_weights = torch.clamp(weights, min=1e-8)
+        return torch.sum(values * safe_weights) / torch.sum(safe_weights)
+
+    def _observe_reach_weight(self, weight: float):
+        if not math.isfinite(weight):
+            return
+        max_samples = 100000
+        if len(self._reach_weight_observations) < max_samples:
+            self._reach_weight_observations.append(float(weight))
+        # Keep deterministic and lock-free behavior in parallel mode.
+
+    def _refresh_effective_reach_clip(self):
+        if not self.use_reach_weighting:
+            self.effective_reach_weight_clip = 1.0
+            return
+        if not self.reach_weight_auto_clip or not self._reach_weight_observations:
+            self.effective_reach_weight_clip = self.reach_weight_clip
+            return
+        observed = np.asarray(self._reach_weight_observations, dtype=np.float64)
+        quantile_clip = float(np.quantile(observed, self.reach_weight_auto_quantile))
+        bounded_clip = max(1e-6, min(1.0, quantile_clip))
+        self.effective_reach_weight_clip = min(self.reach_weight_clip, bounded_clip)
+
+    def _compute_optimal_reach_clip(self):
+        self._refresh_effective_reach_clip()
+        if not self._reach_weight_observations:
+            return {
+                "reach_weight_clip_optimal": float(min(self.reach_weight_clip, 1.0)),
+                "reach_weight_raw_p50": 0.0,
+                "reach_weight_raw_p95": 0.0,
+                "reach_weight_raw_p99": 0.0,
+            }
+        observed = np.asarray(self._reach_weight_observations, dtype=np.float64)
+        return {
+            "reach_weight_clip_optimal": float(self.effective_reach_weight_clip),
+            "reach_weight_raw_p50": float(np.quantile(observed, 0.50)),
+            "reach_weight_raw_p95": float(np.quantile(observed, 0.95)),
+            "reach_weight_raw_p99": float(np.quantile(observed, 0.99)),
+        }
+
+    def _compute_reach_weights(self, reach_probs, current_player: int):
+        if not self.use_reach_weighting:
+            return 1.0, 1.0
+        own_reach = float(max(1e-8, reach_probs[current_player]))
+        opp_reach = 1.0
+        for idx, rp in enumerate(reach_probs):
+            if idx == current_player:
+                continue
+            opp_reach *= float(max(1e-8, rp))
+        if self.reach_weight_mode == "sqrt":
+            own_reach = float(np.sqrt(own_reach))
+            opp_reach = float(np.sqrt(opp_reach))
+        clip_value = max(1e-8, float(self.effective_reach_weight_clip))
+        policy_weight = min(clip_value, own_reach)
+        counterfactual_weight = min(clip_value, opp_reach)
+        self._observe_reach_weight(policy_weight)
+        self._observe_reach_weight(counterfactual_weight)
+        return counterfactual_weight, policy_weight
+
+    def _traverse(self, env, advantage_records, policy_records, stats, rng, reach_probs):
         state = env._get_state()
         if state.get("done", False) or state["street"] == "showdown":
             return self._terminal_utilities(env)
@@ -670,21 +909,34 @@ class DeepCFRTrainer:
             pred_regrets = self.regret_net(x.unsqueeze(0)).squeeze(0).cpu().numpy()
 
         strategy = self._regret_matching(legal_actions, pred_regrets)
-        policy_records.append((x_cpu, strategy.copy()))
+        counterfactual_weight, policy_weight = self._compute_reach_weights(reach_probs, player)
+        policy_records.append((x_cpu, strategy.copy(), policy_weight))
 
         stats["visited_nodes"] += 1
         stats["legal_action_total"] += len(legal_actions)
         stats["entropy_total"] += self._strategy_entropy(strategy, legal_actions)
+        stats["reach_cf_weight_total"] += float(counterfactual_weight)
+        stats["reach_policy_weight_total"] += float(policy_weight)
+        stats["reach_weight_count"] += 1
 
         chosen_idx, chosen_action = self._sample_action(strategy, legal_actions, rng)
         action_utility_vectors = np.zeros((self.num_actions, env.num_players), dtype=np.float32)
 
         chosen_env = env.clone()
         _, _, done, info = chosen_env.step(chosen_action)
+        next_reach = np.array(reach_probs, dtype=np.float64, copy=True)
+        next_reach[player] *= float(max(strategy[chosen_idx], 1e-8))
         if done:
             chosen_utility = self._terminal_utilities(chosen_env, info)
         else:
-            chosen_utility = self._traverse(chosen_env, advantage_records, policy_records, stats, rng)
+            chosen_utility = self._traverse(
+                chosen_env,
+                advantage_records,
+                policy_records,
+                stats,
+                rng,
+                next_reach,
+            )
         action_utility_vectors[chosen_idx] = chosen_utility
 
         alternative_values = self._evaluate_other_actions(env, legal_actions, chosen_action)
@@ -697,7 +949,7 @@ class DeepCFRTrainer:
         for action in legal_actions:
             idx = self.action_to_index[action]
             regret = float(action_player_values[idx] - state_value)
-            advantage_records.append((x_cpu, idx, regret))
+            advantage_records.append((x_cpu, idx, regret, counterfactual_weight))
             stats["regret_abs_total"] += abs(regret)
             stats["regret_count"] += 1
 
@@ -721,17 +973,19 @@ class DeepCFRTrainer:
         epochs = self.regret_epochs if epochs is None else max(1, int(epochs))
 
         for _ in range(epochs):
-            for x, a_idx, target_regret in loader:
+            for x, a_idx, target_regret, sample_weight in loader:
                 x = x.to(self.device)
                 a_idx = a_idx.to(self.device)
                 target_regret = target_regret.to(self.device)
+                sample_weight = sample_weight.to(self.device)
 
                 self.regret_opt.zero_grad(set_to_none=True)
                 with autocast(enabled=self.use_amp):
                     pred = self.regret_net(x)
                     self._require_finite_tensor(pred, "regret_net_output")
                     pred_val = pred.gather(1, a_idx.unsqueeze(1)).squeeze(1)
-                    loss = self.regret_loss_fn(pred_val, target_regret)
+                    per_sample = torch.abs(pred_val - target_regret)
+                    loss = self._weighted_mean(per_sample, sample_weight)
                 self._require_finite_tensor(loss.unsqueeze(0), "regret_loss")
 
                 self._scaler.scale(loss).backward()
@@ -764,15 +1018,20 @@ class DeepCFRTrainer:
         epochs = self.policy_epochs if epochs is None else max(1, int(epochs))
 
         for _ in range(epochs):
-            for x, target_strat in loader:
+            for x, target_strat, sample_weight in loader:
                 x = x.to(self.device)
                 target_strat = target_strat.to(self.device)
+                sample_weight = sample_weight.to(self.device)
 
                 self.policy_opt.zero_grad(set_to_none=True)
                 with autocast(enabled=self.use_amp):
                     log_probs = self.policy_net.log_probs(x)
                     self._require_finite_tensor(log_probs, "policy_net_log_probs")
-                    loss = self.policy_loss_fn(log_probs, target_strat)
+                    per_sample_kl = torch.sum(
+                        target_strat * (torch.log(torch.clamp(target_strat, min=1e-8)) - log_probs),
+                        dim=1,
+                    )
+                    loss = self._weighted_mean(per_sample_kl, sample_weight)
                     if self.entropy_regularization > 0.0:
                         entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=1).mean()
                         loss = loss - (self.entropy_regularization * entropy)
@@ -790,35 +1049,35 @@ class DeepCFRTrainer:
 
         return total_loss / max(1, len(loader) * epochs)
 
-    def _play_hand(self, action_selector):
-        state = self.env.reset()
+    def _play_hand(self, env, action_selector):
+        state = env.reset()
         done = False
         final_info = {}
 
         while not done:
             player = state["current_player"]
             action = action_selector(state, player)
-            state, _, done, final_info = self.env.step(action)
+            state, _, done, final_info = env.step(action)
 
-        return state, self._terminal_utilities(self.env, final_info), final_info
+        return state, self._terminal_utilities(env, final_info), final_info
 
-    def _action_from_policy_net(self, policy_net, state, player, rng):
-        legal_actions = self.env.get_legal_actions()
+    def _action_from_policy_net(self, policy_net, env, state, player, rng):
+        legal_actions = env.get_legal_actions()
         strategy = self._policy_strategy_from_net(policy_net, state, player, legal_actions)
         _, action = self._sample_action(strategy, legal_actions, rng)
         return action
 
-    def _policy_action(self, state, player, rng):
-        return self._action_from_policy_net(self.policy_net, state, player, rng)
+    def _policy_action(self, env, state, player, rng):
+        return self._action_from_policy_net(self.policy_net, env, state, player, rng)
 
-    def _random_action(self, rng=None):
-        legal_actions = self.env.get_legal_actions()
+    def _random_action(self, env, rng=None):
+        legal_actions = env.get_legal_actions()
         active_rng = self.rng if rng is None else rng
         idx = int(active_rng.integers(len(legal_actions)))
         return legal_actions[idx]
 
-    def _heuristic_action(self, state, player, style: str = "tag"):
-        legal_actions = self.env.get_legal_actions()
+    def _heuristic_action(self, env, state, player, style: str = "tag"):
+        legal_actions = env.get_legal_actions()
         bet_actions = self._sorted_bet_actions(legal_actions)
         features = self.iss.encode(state, player)
         equity = float(features["equity"])
@@ -854,10 +1113,10 @@ class DeepCFRTrainer:
             return bet_actions[0]
         return "check" if "check" in legal_actions else legal_actions[0]
 
-    def _collect_eval_metrics(self, hand_results):
-        seat_utilities = np.zeros(self.env.num_players, dtype=np.float64)
-        seat_win_shares = np.zeros(self.env.num_players, dtype=np.float64)
-        seat_tie_rates = np.zeros(self.env.num_players, dtype=np.float64)
+    def _collect_eval_metrics(self, hand_results, num_players: int):
+        seat_utilities = np.zeros(num_players, dtype=np.float64)
+        seat_win_shares = np.zeros(num_players, dtype=np.float64)
+        seat_tie_rates = np.zeros(num_players, dtype=np.float64)
         showdown_hands = 0
         utility_sum_error = 0.0
 
@@ -886,33 +1145,37 @@ class DeepCFRTrainer:
             "utility_sum_error": utility_sum_error / num_hands,
         }
 
-    def evaluate_self_play(self, num_hands: int = 100):
+    def evaluate_self_play(self, num_hands: int = 100, seed=None):
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
         hand_results = []
         for _ in range(num_hands):
-            local_rng = np.random.default_rng(self._next_seed())
-            hand_results.append(self._play_hand(lambda state, player: self._policy_action(state, player, local_rng)))
-        return self._collect_eval_metrics(hand_results)
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
+            hand_results.append(self._play_hand(eval_env, lambda state, player: self._policy_action(eval_env, state, player, local_rng)))
+        return self._collect_eval_metrics(hand_results, num_players=eval_env.num_players)
 
-    def evaluate_against_random(self, num_hands: int = 100):
+    def evaluate_against_random(self, num_hands: int = 100, seed=None):
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
         hero_total_utility = 0.0
         hero_win_share = 0.0
         hero_tie_rate = 0.0
         showdown_hands = 0
-        seat_totals = np.zeros(self.env.num_players, dtype=np.float64)
-        seat_counts = np.zeros(self.env.num_players, dtype=np.float64)
+        seat_totals = np.zeros(eval_env.num_players, dtype=np.float64)
+        seat_counts = np.zeros(eval_env.num_players, dtype=np.float64)
         hero_utilities = []
 
         for hand_idx in range(num_hands):
-            hero_seat = hand_idx % self.env.num_players
+            hero_seat = hand_idx % eval_env.num_players
             seat_counts[hero_seat] += 1.0
-            local_rng = np.random.default_rng(self._next_seed())
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
 
             def action_selector(state, player):
                 if player == hero_seat:
-                    return self._policy_action(state, player, local_rng)
-                return self._random_action(local_rng)
+                    return self._policy_action(eval_env, state, player, local_rng)
+                return self._random_action(eval_env, local_rng)
 
-            final_state, utilities, info = self._play_hand(action_selector)
+            final_state, utilities, info = self._play_hand(eval_env, action_selector)
             hero_utility = float(utilities[hero_seat])
             hero_total_utility += hero_utility
             seat_totals[hero_seat] += hero_utility
@@ -928,7 +1191,7 @@ class DeepCFRTrainer:
                 showdown_hands += 1
 
         seat_ev = []
-        for seat in range(self.env.num_players):
+        for seat in range(eval_env.num_players):
             if seat_counts[seat] > 0:
                 seat_ev.append(float(seat_totals[seat] / seat_counts[seat]))
             else:
@@ -947,7 +1210,9 @@ class DeepCFRTrainer:
             "hero_seat_ev_bb_per_hand": seat_ev,
         }
 
-    def evaluate_against_heuristic(self, num_hands: int = 100):
+    def evaluate_against_heuristic(self, num_hands: int = 100, seed=None):
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
         hero_total_utility = 0.0
         hero_win_share = 0.0
         hero_tie_rate = 0.0
@@ -955,15 +1220,15 @@ class DeepCFRTrainer:
         hero_utilities = []
 
         for hand_idx in range(num_hands):
-            hero_seat = hand_idx % self.env.num_players
-            local_rng = np.random.default_rng(self._next_seed())
+            hero_seat = hand_idx % eval_env.num_players
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
 
             def action_selector(state, player):
                 if player == hero_seat:
-                    return self._policy_action(state, player, local_rng)
-                return self._heuristic_action(state, player, style="tag")
+                    return self._policy_action(eval_env, state, player, local_rng)
+                return self._heuristic_action(eval_env, state, player, style="tag")
 
-            final_state, utilities, info = self._play_hand(action_selector)
+            final_state, utilities, info = self._play_hand(eval_env, action_selector)
             hero_total_utility += float(utilities[hero_seat])
             hero_utilities.append(float(utilities[hero_seat]))
 
@@ -988,23 +1253,25 @@ class DeepCFRTrainer:
             "showdown_rate": showdown_hands / max(1, num_hands),
         }
 
-    def evaluate_against_heuristic_pool(self, num_hands: int = 100):
+    def evaluate_against_heuristic_pool(self, num_hands: int = 100, seed=None):
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
         styles = ("nit", "tag", "lag")
         hero_total_utility = 0.0
         showdown_hands = 0
         hero_utilities = []
 
         for hand_idx in range(num_hands):
-            hero_seat = hand_idx % self.env.num_players
-            local_rng = np.random.default_rng(self._next_seed())
+            hero_seat = hand_idx % eval_env.num_players
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
 
             def action_selector(state, player):
                 if player == hero_seat:
-                    return self._policy_action(state, player, local_rng)
+                    return self._policy_action(eval_env, state, player, local_rng)
                 style = styles[(hand_idx + player) % len(styles)]
-                return self._heuristic_action(state, player, style=style)
+                return self._heuristic_action(eval_env, state, player, style=style)
 
-            final_state, utilities, _ = self._play_hand(action_selector)
+            final_state, utilities, _ = self._play_hand(eval_env, action_selector)
             hero_total_utility += float(utilities[hero_seat])
             hero_utilities.append(float(utilities[hero_seat]))
             if final_state["street"] == "showdown":
@@ -1023,22 +1290,34 @@ class DeepCFRTrainer:
 
     def _load_snapshot_policy(self, snapshot_path):
         cache_key = str(snapshot_path)
-        if cache_key in self.snapshot_policy_cache:
-            self.snapshot_policy_cache.move_to_end(cache_key)
-            return self.snapshot_policy_cache[cache_key]
+        with self._snapshot_cache_lock:
+            cached_model = self.snapshot_policy_cache.get(cache_key)
+            if cached_model is not None:
+                self.snapshot_policy_cache.move_to_end(cache_key)
+                return cached_model
 
         payload = torch.load(snapshot_path, map_location=self.device, weights_only=False)
-        model = PolicyNet(input_dim=self.input_dim, output_dim=self.num_actions).to(self.device)
-        model.load_state_dict(payload["policy_net_state"])
+        model = PolicyNet.from_checkpoint_payload(
+            payload,
+            input_dim=self.input_dim,
+            output_dim=self.num_actions,
+            device=self.device,
+        )
         model.eval()
 
-        self.snapshot_policy_cache[cache_key] = model
-        self.snapshot_policy_cache.move_to_end(cache_key)
-        while len(self.snapshot_policy_cache) > self.max_snapshot_cache:
-            self.snapshot_policy_cache.popitem(last=False)
+        with self._snapshot_cache_lock:
+            cached_model = self.snapshot_policy_cache.get(cache_key)
+            if cached_model is not None:
+                self.snapshot_policy_cache.move_to_end(cache_key)
+                return cached_model
+
+            self.snapshot_policy_cache[cache_key] = model
+            self.snapshot_policy_cache.move_to_end(cache_key)
+            while len(self.snapshot_policy_cache) > self.max_snapshot_cache:
+                self.snapshot_policy_cache.popitem(last=False)
         return model
 
-    def evaluate_against_snapshot_pool(self, num_hands: int = 100, before_iteration=None):
+    def evaluate_against_snapshot_pool(self, num_hands: int = 100, before_iteration=None, seed=None):
         if self.checkpoint_manager is None or self.snapshot_pool_size <= 0:
             return None
 
@@ -1050,6 +1329,8 @@ class DeepCFRTrainer:
             return None
 
         snapshot_models = [self._load_snapshot_policy(path) for path in snapshot_paths]
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
         hero_total_utility = 0.0
         hero_win_share = 0.0
         hero_tie_rate = 0.0
@@ -1057,12 +1338,12 @@ class DeepCFRTrainer:
         hero_utilities = []
 
         for hand_idx in range(num_hands):
-            hero_seat = hand_idx % self.env.num_players
-            local_rng = np.random.default_rng(self._next_seed())
+            hero_seat = hand_idx % eval_env.num_players
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
 
             seat_models = {}
             snapshot_index = 0
-            for seat in range(self.env.num_players):
+            for seat in range(eval_env.num_players):
                 if seat == hero_seat:
                     continue
                 seat_models[seat] = snapshot_models[(hand_idx + snapshot_index) % len(snapshot_models)]
@@ -1070,10 +1351,10 @@ class DeepCFRTrainer:
 
             def action_selector(state, player):
                 if player == hero_seat:
-                    return self._policy_action(state, player, local_rng)
-                return self._action_from_policy_net(seat_models[player], state, player, local_rng)
+                    return self._policy_action(eval_env, state, player, local_rng)
+                return self._action_from_policy_net(seat_models[player], eval_env, state, player, local_rng)
 
-            final_state, utilities, info = self._play_hand(action_selector)
+            final_state, utilities, info = self._play_hand(eval_env, action_selector)
             hero_total_utility += float(utilities[hero_seat])
             hero_utilities.append(float(utilities[hero_seat]))
 
@@ -1099,12 +1380,14 @@ class DeepCFRTrainer:
             "pool_size": len(snapshot_models),
         }
 
-    def evaluate_against_population(self, num_hands: int = 100, before_iteration=None):
+    def evaluate_against_population(self, num_hands: int = 100, before_iteration=None, seed=None):
         population_paths = self._combined_population_paths(before_iteration=before_iteration)
         if not population_paths:
             return None
 
         population_models = [self._load_snapshot_policy(path) for path in population_paths]
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
         hero_total_utility = 0.0
         hero_win_share = 0.0
         hero_tie_rate = 0.0
@@ -1112,21 +1395,21 @@ class DeepCFRTrainer:
         hero_utilities = []
 
         for hand_idx in range(num_hands):
-            hero_seat = hand_idx % self.env.num_players
-            local_rng = np.random.default_rng(self._next_seed())
+            hero_seat = hand_idx % eval_env.num_players
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
             seat_models = {}
 
-            for seat in range(self.env.num_players):
+            for seat in range(eval_env.num_players):
                 if seat == hero_seat:
                     continue
                 seat_models[seat] = population_models[(hand_idx + seat) % len(population_models)]
 
             def action_selector(state, player):
                 if player == hero_seat:
-                    return self._policy_action(state, player, local_rng)
-                return self._action_from_policy_net(seat_models[player], state, player, local_rng)
+                    return self._policy_action(eval_env, state, player, local_rng)
+                return self._action_from_policy_net(seat_models[player], eval_env, state, player, local_rng)
 
-            final_state, utilities, info = self._play_hand(action_selector)
+            final_state, utilities, info = self._play_hand(eval_env, action_selector)
             hero_total_utility += float(utilities[hero_seat])
             hero_utilities.append(float(utilities[hero_seat]))
 
@@ -1161,6 +1444,62 @@ class DeepCFRTrainer:
             metrics["hero_bb_per_100"],
         )
 
+    def evaluate_best_response_proxy(self, num_hands: int = 50, seed=None):
+        master_rng = self._spawn_rng(seed)
+        eval_env = self._make_isolated_env(seed=self._child_seed(master_rng))
+        total_br_utility = 0.0
+        total_policy_utility = 0.0
+        hand_count = max(1, int(num_hands))
+
+        for hand_idx in range(hand_count):
+            hero_seat = hand_idx % eval_env.num_players
+            br_env = eval_env.clone()
+            policy_env = eval_env.clone()
+            br_env.reset()
+            policy_env.reset()
+            local_rng = np.random.default_rng(self._child_seed(master_rng))
+
+            # Approximate BR: hero greedily picks the action with best rollout EV at each decision.
+            br_done = False
+            br_info = {}
+            while not br_done:
+                br_state = br_env._get_state()
+                player = br_state["current_player"]
+                if player == hero_seat:
+                    legal_actions = br_env.get_legal_actions()
+                    best_action = legal_actions[0]
+                    best_value = float("-inf")
+                    for action in legal_actions:
+                        value = float(self._estimate_action_utility(br_env, action, self._child_seed(master_rng))[hero_seat])
+                        if value > best_value:
+                            best_value = value
+                            best_action = action
+                    _, _, br_done, br_info = br_env.step(best_action)
+                else:
+                    action = self._policy_action(br_env, br_state, player, local_rng)
+                    _, _, br_done, br_info = br_env.step(action)
+
+            # Baseline policy-vs-policy with same seat rotation.
+            pol_done = False
+            pol_info = {}
+            while not pol_done:
+                pol_state = policy_env._get_state()
+                player = pol_state["current_player"]
+                action = self._policy_action(policy_env, pol_state, player, local_rng)
+                _, _, pol_done, pol_info = policy_env.step(action)
+
+            total_br_utility += float(self._terminal_utilities(br_env, br_info)[hero_seat])
+            total_policy_utility += float(self._terminal_utilities(policy_env, pol_info)[hero_seat])
+
+        br_ev = total_br_utility / hand_count
+        policy_ev = total_policy_utility / hand_count
+        return {
+            "br_ev_bb_per_hand": br_ev,
+            "policy_ev_bb_per_hand": policy_ev,
+            "br_gap_proxy": max(0.0, br_ev - policy_ev),
+            "br_gap_proxy_bb_per_100": max(0.0, br_ev - policy_ev) * 100.0,
+        }
+
     def _save_checkpoint(self, iteration_number, metrics):
         if self.checkpoint_manager is None:
             return
@@ -1170,7 +1509,8 @@ class DeepCFRTrainer:
             self.best_vs_random_bb_per_100 = metrics["vs_random_bb_per_100"]
         history = [entry.get("robust_score") for entry in self.metrics_history if entry.get("robust_score") is not None]
         best_robust_so_far = max(history) if history else float("-inf")
-        is_best_robust = metrics.get("robust_score", float("-inf")) >= best_robust_so_far
+        robust_score = metrics.get("robust_score")
+        is_best_robust = robust_score is not None and robust_score >= best_robust_so_far
 
         if iteration_number % self.checkpoint_interval != 0 and not is_best and not is_best_robust:
             return
@@ -1260,6 +1600,7 @@ class DeepCFRTrainer:
         for i in range(self.completed_iterations, iterations):
             iteration_number = i + 1
             iter_t0 = time.monotonic()
+            self._refresh_effective_reach_clip()
             print(f"[DeepCFR] Iter {iteration_number:03d}/{iterations}: starting self-play ({episodes} episodes)")
             self.iss.card_abs.reset_equity_stats()
             self._refresh_population_pool()
@@ -1272,28 +1613,60 @@ class DeepCFRTrainer:
             p_loss = self.train_policy_net()
             eval_t0 = time.monotonic()
             print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating (parallel)")
-            eval_executor = ThreadPoolExecutor(max_workers=6)
-            fut_self_play = eval_executor.submit(self.evaluate_self_play, num_hands=eval_hands)
-            fut_vs_random = eval_executor.submit(self.evaluate_against_random, num_hands=random_eval_hands)
-            fut_heuristic = eval_executor.submit(self.evaluate_against_heuristic, num_hands=heuristic_eval_hands)
-            fut_heuristic_pool = eval_executor.submit(self.evaluate_against_heuristic_pool, num_hands=heuristic_eval_hands)
-            fut_snapshot = eval_executor.submit(
-                self.evaluate_against_snapshot_pool,
-                num_hands=snapshot_eval_hands,
-                before_iteration=iteration_number,
-            )
-            fut_population = eval_executor.submit(
-                self.evaluate_against_population,
-                num_hands=population_eval_hands,
-                before_iteration=iteration_number,
-            )
-            self_play_metrics = fut_self_play.result()
-            vs_random_metrics = fut_vs_random.result()
-            heuristic_metrics = fut_heuristic.result()
-            heuristic_pool_metrics = fut_heuristic_pool.result()
-            snapshot_metrics = fut_snapshot.result()
-            population_metrics = fut_population.result()
-            eval_executor.shutdown(wait=False)
+            prev_policy_mode = self.policy_net.training
+            prev_regret_mode = self.regret_net.training
+            self.policy_net.eval()
+            self.regret_net.eval()
+            try:
+                eval_seed_rng = self._spawn_rng()
+                with ThreadPoolExecutor(max_workers=7) as eval_executor:
+                    fut_self_play = eval_executor.submit(
+                        self.evaluate_self_play,
+                        num_hands=eval_hands,
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    fut_vs_random = eval_executor.submit(
+                        self.evaluate_against_random,
+                        num_hands=random_eval_hands,
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    fut_heuristic = eval_executor.submit(
+                        self.evaluate_against_heuristic,
+                        num_hands=heuristic_eval_hands,
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    fut_heuristic_pool = eval_executor.submit(
+                        self.evaluate_against_heuristic_pool,
+                        num_hands=heuristic_eval_hands,
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    fut_br_proxy = eval_executor.submit(
+                        self.evaluate_best_response_proxy,
+                        num_hands=max(20, random_eval_hands // 2),
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    fut_snapshot = eval_executor.submit(
+                        self.evaluate_against_snapshot_pool,
+                        num_hands=snapshot_eval_hands,
+                        before_iteration=iteration_number,
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    fut_population = eval_executor.submit(
+                        self.evaluate_against_population,
+                        num_hands=population_eval_hands,
+                        before_iteration=iteration_number,
+                        seed=self._child_seed(eval_seed_rng),
+                    )
+                    self_play_metrics = fut_self_play.result()
+                    vs_random_metrics = fut_vs_random.result()
+                    heuristic_metrics = fut_heuristic.result()
+                    heuristic_pool_metrics = fut_heuristic_pool.result()
+                    br_proxy_metrics = fut_br_proxy.result()
+                    snapshot_metrics = fut_snapshot.result()
+                    population_metrics = fut_population.result()
+            finally:
+                self.policy_net.train(prev_policy_mode)
+                self.regret_net.train(prev_regret_mode)
             eval_wall = time.monotonic() - eval_t0
             iter_wall = time.monotonic() - iter_t0
 
@@ -1307,6 +1680,9 @@ class DeepCFRTrainer:
                 "avg_branching_factor": traversal_stats["avg_branching_factor"],
                 "avg_policy_entropy": traversal_stats["avg_policy_entropy"],
                 "avg_abs_regret": traversal_stats["avg_abs_regret"],
+                "reach_cf_weight_mean": traversal_stats["reach_cf_weight_mean"],
+                "reach_policy_weight_mean": traversal_stats["reach_policy_weight_mean"],
+                "effective_reach_weight_clip": float(self.effective_reach_weight_clip),
                 "self_play_seat_ev_std": self_play_metrics["seat_ev_std"],
                 "self_play_mean_abs_seat_ev": self_play_metrics["mean_abs_seat_ev_bb_per_hand"],
                 "self_play_showdown_rate": self_play_metrics["showdown_rate"],
@@ -1327,6 +1703,10 @@ class DeepCFRTrainer:
                 "vs_heuristic_pool_bb_per_100": heuristic_pool_metrics["hero_bb_per_100"],
                 "vs_heuristic_pool_bb_per_100_stderr": heuristic_pool_metrics["hero_bb_per_100_stderr"],
                 "vs_heuristic_pool_showdown_rate": heuristic_pool_metrics["showdown_rate"],
+                "br_ev_bb_per_hand": br_proxy_metrics["br_ev_bb_per_hand"],
+                "policy_ev_bb_per_hand": br_proxy_metrics["policy_ev_bb_per_hand"],
+                "br_gap_proxy": br_proxy_metrics["br_gap_proxy"],
+                "br_gap_proxy_bb_per_100": br_proxy_metrics["br_gap_proxy_bb_per_100"],
             }
 
             if snapshot_metrics is not None:
@@ -1349,6 +1729,7 @@ class DeepCFRTrainer:
 
             metrics.update(self.iss.card_abs.get_equity_stats())
             metrics.update(self.iss.get_cache_stats())
+            metrics.update(self._compute_optimal_reach_clip())
             metrics["robust_score"] = self._compute_robust_score(metrics)
             metrics["exploitability_proxy"] = self._compute_exploitability_proxy(metrics)
 
@@ -1388,10 +1769,11 @@ class DeepCFRTrainer:
             )
 
             self.completed_iterations = iteration_number
-            self.metrics_history.append({"iteration": iteration_number, **metrics})
+            self.metrics_history.append(self._compact_metrics_entry(iteration_number, metrics))
             self._save_checkpoint(iteration_number, metrics)
 
             all_metrics = dict(metrics)
+            all_metrics["iteration"] = float(iteration_number)
             for metric_name in self.IMPORTANT_METRIC_KEYS:
                 metric_value = metrics.get(metric_name)
                 if metric_value is not None:
