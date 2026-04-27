@@ -1,6 +1,7 @@
 import copy
 import math
 import random
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
@@ -71,6 +72,9 @@ class DeepCFRTrainer:
         torch_equity_device: str = "cuda",
         use_amp: bool = True,
         use_torch_compile: bool = False,
+        num_layers: int = 2,
+        hidden_dim: int = 128,
+        dropout: float = 0.0,
     ):
         self.env = env
         self.seed = seed
@@ -116,8 +120,14 @@ class DeepCFRTrainer:
         self.use_torch_compile = requested_compile and (self.parallel_workers <= 1)
         self.rng = np.random.default_rng(seed)
 
-        self.regret_net = RegretNet(input_dim=self.input_dim, output_dim=self.num_actions).to(self.device)
-        self.policy_net = PolicyNet(input_dim=self.input_dim, output_dim=self.num_actions).to(self.device)
+        self.regret_net = RegretNet(
+            input_dim=self.input_dim, hidden_dim=hidden_dim,
+            output_dim=self.num_actions, num_layers=num_layers, dropout=dropout,
+        ).to(self.device)
+        self.policy_net = PolicyNet(
+            input_dim=self.input_dim, hidden_dim=hidden_dim,
+            output_dim=self.num_actions, num_layers=num_layers, dropout=dropout,
+        ).to(self.device)
         if requested_compile and not self.use_torch_compile:
             print("[Runtime] torch.compile disabled (parallel_workers>1).")
 
@@ -760,11 +770,11 @@ class DeepCFRTrainer:
 
                 self.policy_opt.zero_grad(set_to_none=True)
                 with autocast(enabled=self.use_amp):
-                    pred_strat = self.policy_net(x)
-                    self._require_finite_tensor(pred_strat, "policy_net_output")
-                    loss = self.policy_loss_fn(torch.log(pred_strat.clamp_min(1e-8)), target_strat)
+                    log_probs = self.policy_net.log_probs(x)
+                    self._require_finite_tensor(log_probs, "policy_net_log_probs")
+                    loss = self.policy_loss_fn(log_probs, target_strat)
                     if self.entropy_regularization > 0.0:
-                        entropy = -torch.sum(pred_strat * torch.log(pred_strat.clamp_min(1e-8)), dim=1).mean()
+                        entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=1).mean()
                         loss = loss - (self.entropy_regularization * entropy)
                 self._require_finite_tensor(loss.unsqueeze(0), "policy_loss")
 
@@ -1249,36 +1259,50 @@ class DeepCFRTrainer:
 
         for i in range(self.completed_iterations, iterations):
             iteration_number = i + 1
+            iter_t0 = time.monotonic()
             print(f"[DeepCFR] Iter {iteration_number:03d}/{iterations}: starting self-play ({episodes} episodes)")
             self.iss.card_abs.reset_equity_stats()
             self._refresh_population_pool()
+            sp_t0 = time.monotonic()
             traversal_stats = self.self_play(episodes=episodes)
+            sp_wall = time.monotonic() - sp_t0
             print(f"[DeepCFR] Iter {iteration_number:03d}: training regret net")
             r_loss = self.train_regret_net()
             print(f"[DeepCFR] Iter {iteration_number:03d}: training policy net")
             p_loss = self.train_policy_net()
-            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating self-play ({eval_hands} hands)")
-            self_play_metrics = self.evaluate_self_play(num_hands=eval_hands)
-            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating vs random ({random_eval_hands} hands)")
-            vs_random_metrics = self.evaluate_against_random(num_hands=random_eval_hands)
-            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating vs heuristic ({heuristic_eval_hands} hands)")
-            heuristic_metrics = self.evaluate_against_heuristic(num_hands=heuristic_eval_hands)
-            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating vs heuristic pool ({heuristic_eval_hands} hands)")
-            heuristic_pool_metrics = self.evaluate_against_heuristic_pool(num_hands=heuristic_eval_hands)
-            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating vs snapshot pool ({snapshot_eval_hands} hands)")
-            snapshot_metrics = self.evaluate_against_snapshot_pool(
+            eval_t0 = time.monotonic()
+            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating (parallel)")
+            eval_executor = ThreadPoolExecutor(max_workers=6)
+            fut_self_play = eval_executor.submit(self.evaluate_self_play, num_hands=eval_hands)
+            fut_vs_random = eval_executor.submit(self.evaluate_against_random, num_hands=random_eval_hands)
+            fut_heuristic = eval_executor.submit(self.evaluate_against_heuristic, num_hands=heuristic_eval_hands)
+            fut_heuristic_pool = eval_executor.submit(self.evaluate_against_heuristic_pool, num_hands=heuristic_eval_hands)
+            fut_snapshot = eval_executor.submit(
+                self.evaluate_against_snapshot_pool,
                 num_hands=snapshot_eval_hands,
                 before_iteration=iteration_number,
             )
-            print(f"[DeepCFR] Iter {iteration_number:03d}: evaluating vs population ({population_eval_hands} hands)")
-            population_metrics = self.evaluate_against_population(
+            fut_population = eval_executor.submit(
+                self.evaluate_against_population,
                 num_hands=population_eval_hands,
                 before_iteration=iteration_number,
             )
+            self_play_metrics = fut_self_play.result()
+            vs_random_metrics = fut_vs_random.result()
+            heuristic_metrics = fut_heuristic.result()
+            heuristic_pool_metrics = fut_heuristic_pool.result()
+            snapshot_metrics = fut_snapshot.result()
+            population_metrics = fut_population.result()
+            eval_executor.shutdown(wait=False)
+            eval_wall = time.monotonic() - eval_t0
+            iter_wall = time.monotonic() - iter_t0
 
             metrics = {
                 "regret_loss": r_loss,
                 "policy_loss": p_loss,
+                "iteration_wall_time_seconds": iter_wall,
+                "self_play_wall_time_seconds": sp_wall,
+                "evaluation_wall_time_seconds": eval_wall,
                 "traversal_nodes": traversal_stats["visited_nodes"],
                 "avg_branching_factor": traversal_stats["avg_branching_factor"],
                 "avg_policy_entropy": traversal_stats["avg_policy_entropy"],
@@ -1324,6 +1348,7 @@ class DeepCFRTrainer:
                 metrics["population_pool_size"] = population_metrics["pool_size"]
 
             metrics.update(self.iss.card_abs.get_equity_stats())
+            metrics.update(self.iss.get_cache_stats())
             metrics["robust_score"] = self._compute_robust_score(metrics)
             metrics["exploitability_proxy"] = self._compute_exploitability_proxy(metrics)
 

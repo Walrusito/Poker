@@ -1,6 +1,8 @@
 import itertools
 import random
 import threading
+from collections import OrderedDict
+
 import numpy as np
 import torch
 
@@ -11,19 +13,21 @@ from env.rules import evaluate_7, evaluate_7_batch
 class HandEquity:
     """
     Monte Carlo / exact river equity estimator against random opponents.
-    Optimizado con NumPy para generación vectorizada de repartos.
+    Optimizado con NumPy para generacion vectorizada de repartos.
     """
 
-    def __init__(self, simulations=200, seed=None, use_torch_backend: bool = False, torch_device: str = "cuda"):
+    def __init__(self, simulations=200, seed=None, use_torch_backend: bool = False,
+                 torch_device: str = "cuda", max_cache_size: int = 50_000):
         self.simulations = simulations
         self.seed = seed
         self.street_simulations = {
-            0: simulations, 
-            3: simulations, 
-            4: max(simulations * 2, simulations), 
+            0: simulations,
+            3: simulations,
+            4: max(simulations * 2, simulations),
             5: max(simulations * 3, simulations)
         }
-        self.cache = {}
+        self.max_cache_size = max_cache_size
+        self.cache: OrderedDict = OrderedDict()
         self._lock = threading.RLock()
         self.use_torch_backend = bool(use_torch_backend)
         self.torch_device = torch_device
@@ -39,9 +43,10 @@ class HandEquity:
         board_len = len(board)
         simulations = int(self.street_simulations.get(board_len, self.simulations))
         key = (tuple(sorted(hand)), tuple(sorted(board)), num_players, simulations)
-        
+
         with self._lock:
             if key in self.cache:
+                self.cache.move_to_end(key)
                 return self.cache[key]
 
         if len(board) == 5 and num_players == 2:
@@ -54,6 +59,8 @@ class HandEquity:
 
         with self._lock:
             self.cache[key] = equity
+            if len(self.cache) > self.max_cache_size:
+                self.cache.popitem(last=False)
         return equity
 
     def _estimate_monte_carlo(self, hand, board, num_players, simulations):

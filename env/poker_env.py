@@ -8,7 +8,25 @@ from utils.position import Position
 
 
 class PokerEnv:
-    ACTIONS = list(DEFAULT_ACTIONS)
+    DEFAULT_ACTIONS_LIST = list(DEFAULT_ACTIONS)
+
+    __slots__ = (
+        "num_players", "starting_stack", "small_blind", "big_blind",
+        "reward_unit", "seed", "rng", "bet_sizing", "_actions", "position",
+        "hand_index", "reference_player", "deck", "hands", "board",
+        "pot", "contributions", "bets", "stacks", "active", "street",
+        "history", "done", "pending_players", "current_player",
+        "last_raise_size", "last_aggressor", "last_action",
+        "street_actions", "last_terminal_utilities", "last_winners",
+    )
+
+    @property
+    def ACTIONS(self):
+        return self._actions
+
+    @ACTIONS.setter
+    def ACTIONS(self, value):
+        self._actions = value
 
     def __init__(
         self,
@@ -102,7 +120,7 @@ class PokerEnv:
         new.seed = self.seed
         new.rng = self.rng
         new.bet_sizing = self.bet_sizing
-        new.ACTIONS = self.ACTIONS
+        new._actions = self._actions
         new.position = self.position.clone()
         new.hand_index = self.hand_index
         new.reference_player = self.reference_player

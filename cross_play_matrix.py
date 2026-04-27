@@ -164,18 +164,27 @@ def main():
 
     run_names = [selected["run_name"] for selected in selected_runs]
     matrix = {}
+    matchup_tasks = []
     seed_offset = 0
     for hero_name in run_names:
         for villain_name in run_names:
-            matrix[(hero_name, villain_name)] = evaluate_matchup(
+            matchup_tasks.append((hero_name, villain_name, seed_offset))
+            seed_offset += 97
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(4, len(matchup_tasks))) as executor:
+        futures = {}
+        for hero_name, villain_name, so in matchup_tasks:
+            fut = executor.submit(
+                evaluate_matchup,
                 loaded_models[hero_name],
                 loaded_models[villain_name],
-                iss,
-                args,
-                device,
-                seed_offset=seed_offset,
+                iss, args, device, seed_offset=so,
             )
-            seed_offset += 97
+            futures[fut] = (hero_name, villain_name)
+        for fut in futures:
+            hero_name, villain_name = futures[fut]
+            matrix[(hero_name, villain_name)] = fut.result()
 
     print(format_matrix(run_names, matrix))
 

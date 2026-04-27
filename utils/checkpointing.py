@@ -24,12 +24,14 @@ class CheckpointManager:
         run_name: str = None,
         resume_mode: str = "auto",
         seed=None,
+        keep_last: int = 0,
     ):
         self.root_dir = Path(root_dir)
         self.experiment = experiment
         self.run_name = run_name
         self.resume_mode = resume_mode
         self.seed = seed
+        self.keep_last = keep_last
         self.experiment_dir = self.root_dir / experiment
         self.run_dir = None
         self.run_summary_path = None
@@ -107,7 +109,23 @@ class CheckpointManager:
             torch.save(payload, self.best_robust_checkpoint_path)
         self._update_summary(iteration, metrics or {}, checkpoint_path, is_best=is_best, is_best_robust=is_best_robust)
         self._write_latest_pointer()
+        self._cleanup_old_checkpoints()
         return checkpoint_path
+
+    def _cleanup_old_checkpoints(self):
+        if self.keep_last <= 0:
+            return
+        protected = {
+            self.latest_checkpoint_path,
+            self.best_checkpoint_path,
+            self.best_robust_checkpoint_path,
+        }
+        iter_files = sorted(self.run_dir.glob("iter_*.pt"))
+        if len(iter_files) <= self.keep_last:
+            return
+        for old in iter_files[:-self.keep_last]:
+            if old.resolve() not in {p.resolve() for p in protected if p is not None and p.exists()}:
+                old.unlink(missing_ok=True)
 
     def list_snapshot_paths(self, before_iteration=None, limit=None):
         checkpoint_paths = sorted(self.run_dir.glob("iter_*.pt"))

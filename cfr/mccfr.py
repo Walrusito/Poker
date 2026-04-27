@@ -1,4 +1,3 @@
-import copy
 from collections import defaultdict
 
 from utils.information_set import InformationSetBuilder
@@ -52,7 +51,7 @@ class MCCFR:
         # -----------------------------
         for action in actions:
 
-            env_copy = copy.deepcopy(env)
+            env_copy = env.clone()
 
             # FIX: step() returns (state, reward, done, info) — 4 values
             # Previous code unpacked only 3, causing ValueError
