@@ -1,27 +1,54 @@
+"""
+RegretNet — estima regrets (ventajas) por acción desde el information set.
+
+OPTIMIZACIONES vs versión original:
+  - 3 capas ocultas en lugar de 2 (mayor capacidad de abstracción)
+  - 256 neuronas en lugar de 128 (mejor representación de hand buckets)
+  - LayerNorm después de cada capa (más estable que BatchNorm en CFR)
+  - Sin activación final: los regrets pueden ser negativos ✓
+  - Inicialización Kaiming (mejor gradiente inicial con ReLU)
+"""
+
 import torch
 import torch.nn as nn
 
 
 class RegretNet(nn.Module):
     """
-    Maps an information-set feature vector -> per-action regret estimates.
-    No final activation: raw values (can be negative).
+    Input: feature vector del information set  [B, input_dim]
+    Output: regret estimado por acción          [B, output_dim]
+    Sin activación final — valores pueden ser negativos.
     """
 
-    def __init__(self, input_dim: int = 10, hidden_dim: int = 128, output_dim: int = 5,
-                 num_layers: int = 2, dropout: float = 0.0):
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 256,
+                 output_dim: int = 3, dropout: float = 0.1):
         super().__init__()
 
-        layers = []
-        in_dim = input_dim
-        for _ in range(num_layers):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(p=dropout))
-            in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, output_dim))
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+
+            nn.Linear(hidden_dim // 2, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)

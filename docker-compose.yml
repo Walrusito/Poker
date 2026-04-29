@@ -1,135 +1,33 @@
+version: "3.9"
+
 services:
   poker-ai:
     build: .
-    container_name: poker_cfr_ai_bueno
-    gpus: all
+    container_name: poker_cfr_optimized
     volumes:
       - ./mlruns:/app/mlruns
-      - ./data/lut:/app/data/lut
-      - ./artifacts:/app/artifacts
     working_dir: /app
-    command:
-      - "--iterations"
-      - "${POKER_ITERATIONS:-20}"
-      - "--episodes"
-      - "${POKER_EPISODES:-2000}"
-      - "--eval-hands"
-      - "${POKER_EVAL_HANDS:-5000}"
-      - "--eval-random-hands"
-      - "${POKER_EVAL_RANDOM_HANDS:-0}"
-      - "--eval-snapshot-hands"
-      - "${POKER_EVAL_SNAPSHOT_HANDS:-0}"
-      - "--eval-population-hands"
-      - "${POKER_EVAL_POPULATION_HANDS:-0}"
-      - "--eval-heuristic-hands"
-      - "${POKER_EVAL_HEURISTIC_HANDS:-0}"
-      - "--players"
-      - "${POKER_PLAYERS:-2}"
-      - "--starting-stack"
-      - "${POKER_STARTING_STACK:-10000}"
-      - "--small-blind"
-      - "${POKER_SMALL_BLIND:-50}"
-      - "--big-blind"
-      - "${POKER_BIG_BLIND:-100}"
-      - "--mc-simulations"
-      - "${POKER_MC_SIMULATIONS:-200}"
-      - "--lut-simulations"
-      - "${POKER_LUT_SIMULATIONS:-1500}"
-      - "--lut-dir"
-      - "${POKER_LUT_DIR:-data/lut}"
-      - "--rollouts-per-action"
-      - "${POKER_ROLLOUTS_PER_ACTION:-1}"
-      - "--feature-cache-size"
-      - "${POKER_FEATURE_CACHE_SIZE:-50000}"
-      - "--batch-size"
-      - "${POKER_BATCH_SIZE:-128}"
-      - "--regret-epochs"
-      - "${POKER_REGRET_EPOCHS:-4}"
-      - "--policy-epochs"
-      - "${POKER_POLICY_EPOCHS:-1}"
-      - "--gradient-clip"
-      - "${POKER_GRADIENT_CLIP:-1.0}"
-      - "--parallel-workers"
-      - "${POKER_PARALLEL_WORKERS:-1}"
-      - "${POKER_DISABLE_DETERMINISTIC_PARALLEL:-}"
-      - "--dataloader-workers"
-      - "${POKER_DATALOADER_WORKERS:-2}"
-      - "--torch-num-threads"
-      - "${POKER_TORCH_NUM_THREADS:-16}"
-      - "--rollout-batch-size"
-      - "${POKER_ROLLOUT_BATCH_SIZE:-32}"
-      # Optional flags: set env var to the literal flag string to enable.
-      # Example: POKER_USE_AMP=--use-amp
-      # Example: POKER_USE_TORCH_COMPILE=--use-torch-compile
-      - "${POKER_USE_AMP:-}"
-      - "${POKER_USE_TORCH_COMPILE:-}"
-      - "${POKER_DISABLE_REACH_WEIGHTING:-}"
-      - "--reach-weight-mode"
-      - "${POKER_REACH_WEIGHT_MODE:-linear}"
-      - "--reach-weight-clip"
-      - "${POKER_REACH_WEIGHT_CLIP:-100.0}"
-      - "${POKER_DISABLE_REACH_AUTO_CLIP:-}"
-      - "--reach-auto-clip-quantile"
-      - "${POKER_REACH_AUTO_CLIP_QUANTILE:-0.95}"
-      - "--snapshot-pool-size"
-      - "${POKER_SNAPSHOT_POOL_SIZE:-4}"
-      - "--max-snapshot-cache"
-      - "${POKER_MAX_SNAPSHOT_CACHE:-8}"
-      - "--population-run-limit"
-      - "${POKER_POPULATION_RUN_LIMIT:-6}"
-      - "--population-checkpoint-name"
-      - "${POKER_POPULATION_CHECKPOINT_NAME:-best.pt}"
-      - "--population-mix-prob"
-      - "${POKER_POPULATION_MIX_PROB:-0.0}"
-      - "--entropy-regularization"
-      - "${POKER_ENTROPY_REGULARIZATION:-0.03}"
-      - "--policy-smoothing-alpha"
-      - "${POKER_POLICY_SMOOTHING_ALPHA:-0.05}"
-      - "--checkpoint-interval"
-      - "${POKER_CHECKPOINT_INTERVAL:-1}"
-      - "--early-stop-patience"
-      - "${POKER_EARLY_STOP_PATIENCE:-0}"
-      - "--early-stop-min-iters"
-      - "${POKER_EARLY_STOP_MIN_ITERS:-5}"
-      - "--early-stop-entropy-floor"
-      - "${POKER_EARLY_STOP_ENTROPY_FLOOR:-0.02}"
-      - "--early-stop-entropy-patience"
-      - "${POKER_EARLY_STOP_ENTROPY_PATIENCE:-3}"
-      - "--early-stop-regret-loss-ceiling"
-      - "${POKER_EARLY_STOP_REGRET_LOSS_CEILING:-500.0}"
-      - "--early-stop-policy-loss-ceiling"
-      - "${POKER_EARLY_STOP_POLICY_LOSS_CEILING:-25.0}"
-      - "--checkpoint-dir"
-      - "${POKER_CHECKPOINT_DIR:-artifacts/checkpoints}"
-      - "--run-name"
-      - "${POKER_RUN_NAME:-}"
-      - "--resume-mode"
-      - "${POKER_RESUME_MODE:-auto}"
-      - "--seed"
-      - "${POKER_SEED:-7}"
-      - "--experiment"
-      - "${POKER_EXPERIMENT:-poker_cfr_ai}"
-      - "--command-file"
-      - "${POKER_COMMAND_FILE:-artifacts/last_run_command.txt}"
+    # Defaults optimizados para Ryzen 7 5800X + RTX 3060 12 GB
+    command: [
+      "--iterations", "50",
+      "--episodes", "200",
+      "--eval-hands", "500",
+      "--batch-size", "512"
+    ]
     environment:
       - MLFLOW_TRACKING_URI=file:/app/mlruns
       - PYTHONUNBUFFERED=1
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
-      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-16}
+      - TORCH_BACKENDS_CUDNN_BENCHMARK=1
+      - OMP_NUM_THREADS=8
+    # ── GPU passthrough (requiere nvidia-container-toolkit) ──────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: on-failure
-
-  poker-tests:
-    build: .
-    working_dir: /app
-    volumes:
-      - ./data/lut:/app/data/lut
-      - ./artifacts:/app/artifacts
-    environment:
-      - PYTHONPATH=/app
-    entrypoint: ["pytest"]
-    command: ["tests", "-q"]
 
   mlflow-ui:
     image: python:3.11-slim
@@ -140,6 +38,7 @@ services:
     ports:
       - "5000:5000"
     command: >
-      sh -c "pip install mlflow==2.12.2 --quiet &&
+      sh -c "pip install mlflow --quiet &&
              mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri file:/app/mlruns"
-    restart: unless-stopped
+    depends_on:
+      - poker-ai

@@ -42,7 +42,7 @@ class RangeModel:
         -> belief update via CFR regrets
         """
 
-        if action == "raise" or action.startswith("bet_") or action == "all_in":
+        if action == "raise":
             self.range["AA"] *= 1.2
             self.range["KK"] *= 1.1
             self.range["random"] *= 0.8

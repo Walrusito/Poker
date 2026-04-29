@@ -4,12 +4,13 @@ from typing import Any, List
 
 class ReservoirBuffer:
     """
-    Reservoir Sampling Buffer -- critical for Deep CFR.
+    Reservoir Sampling Buffer — critical for Deep CFR.
 
     Maintains a uniform distribution over all experiences seen in time.
-    """
 
-    __slots__ = ("max_size", "data", "n_seen")
+    FIX: sample() now returns a shuffled copy so training does not always
+    iterate in insertion order (which can create spurious gradient correlations).
+    """
 
     def __init__(self, max_size: int = 50_000):
         self.max_size = max_size
