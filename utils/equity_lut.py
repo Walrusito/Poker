@@ -7,6 +7,7 @@ Postflop uses structural buckets instead of exact-card keys.
 
 import json
 import pickle
+import queue
 import threading
 import time
 from pathlib import Path
@@ -68,6 +69,12 @@ class EquityLUT:
             use_torch_backend=use_torch_backend,
             torch_device=torch_device,
         )
+        self._save_queue: queue.Queue = queue.Queue()
+        self._save_thread = threading.Thread(
+            target=self._save_worker, daemon=True
+        )
+        self._save_thread.start()
+
         self._ensure_table_files()
 
     def _warmup_hand(self, hand, num_players):
@@ -156,7 +163,7 @@ class EquityLUT:
                 self._stats["misses_by_street"][street] += 1
                 self._pending_saves[street] += 1
                 if self._pending_saves[street] >= _SAVE_INTERVAL:
-                    self._save_street_table(street, table)
+                    self._save_queue.put((street, dict(table)))
                     self._pending_saves[street] = 0
             else:
                 self._stats["hits"] += 1
@@ -168,6 +175,20 @@ class EquityLUT:
 
         return equity
 
+    def _save_worker(self):
+        """Background thread that drains the save queue."""
+        while True:
+            item = self._save_queue.get()
+            if item is None:
+                break
+            street, snapshot = item
+            try:
+                self._save_street_table(street, snapshot)
+            except Exception:
+                pass
+            finally:
+                self._save_queue.task_done()
+
     def flush(self):
         with self._lock:
             for street, table in (
@@ -177,8 +198,9 @@ class EquityLUT:
                 ("river", self.river_table),
             ):
                 if self._pending_saves[street] > 0:
-                    self._save_street_table(street, table)
+                    self._save_queue.put((street, dict(table)))
                     self._pending_saves[street] = 0
+        self._save_queue.join()
 
     def reset_stats(self):
         with self._lock:

@@ -6,12 +6,12 @@ class AdvantageDataset(TorchDataset):
     """
     Dataset para RegretNet.  Cada item: (features, action_idx, advantage).
 
-    FIX original: __getitem__ devolvía tuplas sin conversión a tensor,
-    causando crashes en DataLoader. Ahora todo está correctamente tipado.
+    Optimisation: uses buffer.snapshot() (direct reference, no copy).
+    DataLoader(shuffle=True) handles random ordering.
     """
 
     def __init__(self, buffer):
-        self.data = buffer.sample()   # snapshot barajado del buffer
+        self.data = buffer.snapshot()
 
     def __len__(self) -> int:
         return len(self.data)
@@ -31,7 +31,7 @@ class PolicyDataset(TorchDataset):
     """
 
     def __init__(self, buffer):
-        self.data = buffer.sample()
+        self.data = buffer.snapshot()
 
     def __len__(self) -> int:
         return len(self.data)

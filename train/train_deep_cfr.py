@@ -32,6 +32,9 @@ OPTIMIZACIONES HARDWARE (Ryzen 7 5800X + RTX 3060 12 GB):
 ─────────────────────────────────────────────────────────────────────────────
 """
 
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -54,6 +57,13 @@ ACTION_LIST = ["fold", "call", "raise"]
 # 5 features: pot, player, board_len, stack_ratio, card_bucket
 # ─────────────────────────────────────────────────────────────────────────────
 FEATURE_DIM = 5
+
+
+def _optimal_workers(dataset_size: int, batch_size: int) -> int:
+    """Dynamic num_workers: avoid fork overhead for tiny datasets."""
+    if dataset_size < batch_size * 4:
+        return 0
+    return min(4, os.cpu_count() or 1)
 
 
 class DeepCFRTrainer:
@@ -192,13 +202,15 @@ class DeepCFRTrainer:
 
         self.regret_net.train()
         dataset = AdvantageDataset(self.advantage_buffer)
+        n_workers = _optimal_workers(len(dataset), batch_size)
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,          # Ryzen 5800X: 4 workers CPU paralelo
+            num_workers=n_workers,
             pin_memory=(self.device.type == "cuda"),
             drop_last=True,
+            persistent_workers=(n_workers > 0),
         )
 
         total_loss = 0.0
@@ -241,13 +253,15 @@ class DeepCFRTrainer:
 
         self.policy_net.train()
         dataset = PolicyDataset(self.policy_buffer)
+        n_workers = _optimal_workers(len(dataset), batch_size)
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=n_workers,
             pin_memory=(self.device.type == "cuda"),
             drop_last=True,
+            persistent_workers=(n_workers > 0),
         )
 
         loss_fn = nn.MSELoss()
