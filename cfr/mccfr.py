@@ -136,6 +136,7 @@ class MCCFR:
 
         # --- Evaluate each action (snapshot/restore instead of deepcopy) ---
         action_utils: dict[str, List[float]] = {}
+        pruned: set[str] = set()
         node_util = [0.0] * len(reach_probs)
 
         for action in actions:
@@ -143,7 +144,7 @@ class MCCFR:
             if pruning_active:
                 cumulative = self.regret[info_set].get(action, 0.0)
                 if cumulative < -self.prune_threshold:
-                    action_utils[action] = [0.0] * len(reach_probs)
+                    pruned.add(action)
                     continue
 
             snap = env.get_snapshot()
@@ -161,8 +162,10 @@ class MCCFR:
             for p in range(len(reach_probs)):
                 node_util[p] += strategy[action] * action_utils[action][p]
 
-        # --- Regret update (only for acting player, using counterfactual reach) ---
+        # --- Regret update (skip pruned actions to avoid negative feedback loop) ---
         for action in actions:
+            if action in pruned:
+                continue
             regret = action_utils[action][player] - node_util[player]
             self.regret[info_set][action] += cf_reach * regret
 

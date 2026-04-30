@@ -90,7 +90,7 @@ class HandEquity:
             elif hero_ties_all:
                 ties += 1
 
-        equity = (wins + 0.5 * ties) / n_sims
+        equity = (wins + ties / num_players) / n_sims
         self._cache[key] = equity
         return equity
 
