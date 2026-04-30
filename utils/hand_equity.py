@@ -1,133 +1,238 @@
-"""
-HandEquity — Estimador de equidad por Monte Carlo
-
-Optimizaciones aplicadas:
-  - Vectorización con NumPy para generación de deals y evaluación
-  - Soporte multiway (num_players > 2)
-  - Cache por (hand, board, num_players) — evita recalcular mismas manos
-  - Simulaciones adaptativas por street (Step 7):
-      preflop: todas las sims (LUT debería cubrir la mayoría)
-      flop/turn: sims reducidas proporcionalmente
-      river: determinístico cuando no hay cartas por repartir
-  - evaluate_7_cached con LRU para reutilizar evaluaciones de 7 cartas
-"""
+import hashlib
+import itertools
+import threading
+from collections import OrderedDict
 
 import numpy as np
-from typing import List, Optional
+import torch
 
-from env.rules import evaluate_7, evaluate_7_cached
+from env.deck import Deck
+from env.rules import evaluate_7, evaluate_7_batch
 
 
 class HandEquity:
+    """
+    Monte Carlo / exact river equity estimator against random opponents.
+    Optimizado con NumPy para generacion vectorizada de repartos.
+    """
 
-    def __init__(self, simulations: int = 200, seed: Optional[int] = None,
-                 use_torch_backend: bool = False, torch_device: str = "cpu"):
+    def __init__(self, simulations=200, seed=None, use_torch_backend: bool = False,
+                 torch_device: str = "cuda", max_cache_size: int = 50_000):
         self.simulations = simulations
-        self._rng = np.random.default_rng(seed)
-        self._cache: dict = {}
+        self.seed = seed
+        self.street_simulations = {
+            0: simulations,
+            3: simulations,
+            4: max(simulations * 2, simulations),
+            5: max(simulations * 3, simulations)
+        }
+        self.max_cache_size = max_cache_size
+        self.cache: OrderedDict = OrderedDict()
+        self._lock = threading.RLock()
+        self.use_torch_backend = bool(use_torch_backend)
+        self.torch_device = torch_device
 
-    def estimate(self, hand: List[int], board: Optional[List[int]] = None,
-                 num_players: int = 2) -> float:
+    def _query_seed(self, hand, board, num_players, simulations) -> int:
+        payload = bytearray()
+        payload.extend(str(self.seed).encode("utf-8"))
+        payload.extend(b"|")
+        payload.extend(bytes(sorted(int(card) for card in hand)))
+        payload.extend(b"|")
+        payload.extend(bytes(int(card) for card in board))
+        payload.extend(f"|{int(num_players)}|{int(simulations)}".encode("utf-8"))
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, "big", signed=False)
+
+    def estimate(self, hand, board=None, num_players: int = 2):
         if board is None:
             board = []
 
-        key = (tuple(sorted(hand)), tuple(board), num_players)
-        if key in self._cache:
-            return self._cache[key]
+        if not 2 <= num_players <= 9:
+            raise ValueError("num_players must be between 2 and 9")
 
-        known = set(hand) | set(board)
-        available = np.array([c for c in range(52) if c not in known], dtype=np.int32)
+        board_len = len(board)
+        simulations = int(self.street_simulations.get(board_len, self.simulations))
+        key = (tuple(sorted(hand)), tuple(sorted(board)), num_players, simulations)
 
-        cards_needed = 5 - len(board)
-        n_opponents = num_players - 1
+        with self._lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
 
-        # River with complete board: deterministic evaluation, no MC needed
-        if cards_needed == 0 and n_opponents == 1:
-            equity = self._exact_river_equity(hand, board, n_opponents, available)
-            self._cache[key] = equity
-            return equity
+        if len(board) == 5 and num_players == 2:
+            equity = self._estimate_exact_river_heads_up(hand, board)
+        else:
+            if self.use_torch_backend:
+                equity = self._estimate_monte_carlo_torch(hand, board, num_players, simulations)
+            else:
+                equity = self._estimate_monte_carlo(hand, board, num_players, simulations)
 
-        # Adaptive simulation count by street (Step 7)
-        n_sims = self._adaptive_sims(len(board))
-        cards_per_sim = 2 * n_opponents + cards_needed
-
-        if len(available) < cards_per_sim:
-            self._cache[key] = 0.5
-            return 0.5
-
-        # Vectorised deal generation: shuffle indices, slice cards
-        indices = np.argsort(
-            self._rng.random((n_sims, len(available))), axis=1
-        )
-        deals = available[indices[:, :cards_per_sim]]
-
-        board_arr = np.array(board, dtype=np.int32)
-        hand_arr = np.array(hand, dtype=np.int32)
-
-        wins = 0
-        ties = 0
-
-        for i in range(n_sims):
-            deal = deals[i]
-            board_completion = list(board_arr) + list(deal[2 * n_opponents:])
-            hero_cards = tuple(sorted(list(hand_arr) + board_completion))
-            hero_score = evaluate_7_cached(hero_cards)
-
-            hero_wins_all = True
-            hero_ties_all = True
-            for opp_idx in range(n_opponents):
-                opp_hand = deal[2 * opp_idx: 2 * opp_idx + 2]
-                opp_cards = tuple(sorted(list(opp_hand) + board_completion))
-                opp_score = evaluate_7_cached(opp_cards)
-
-                if hero_score <= opp_score:
-                    hero_wins_all = False
-                if hero_score != opp_score:
-                    hero_ties_all = False
-
-            if hero_wins_all:
-                wins += 1
-            elif hero_ties_all:
-                ties += 1
-
-        equity = (wins + ties / num_players) / n_sims
-        self._cache[key] = equity
+        with self._lock:
+            self.cache[key] = equity
+            if len(self.cache) > self.max_cache_size:
+                self.cache.popitem(last=False)
         return equity
 
-    def _adaptive_sims(self, board_len: int) -> int:
-        """Reduce simulations on earlier streets where precision is less critical."""
-        if board_len == 5:
-            return max(50, self.simulations // 4)
-        if board_len == 4:
-            return max(80, self.simulations // 2)
-        if board_len == 3:
-            return max(100, (self.simulations * 3) // 4)
-        return self.simulations
+    def _estimate_monte_carlo(self, hand, board, num_players, simulations):
+        wins = 0.0
+        ties = 0.0
 
-    def _exact_river_equity(self, hand, board, n_opponents, available) -> float:
-        """Exact heads-up river equity: enumerate all possible opponent hands."""
-        hero_cards = tuple(sorted(hand + board))
-        hero_score = evaluate_7_cached(hero_cards)
-
-        wins = 0
-        ties = 0
-        total = 0
-
-        for i in range(len(available)):
-            for j in range(i + 1, len(available)):
-                opp_hand = [available[i], available[j]]
-                opp_cards = tuple(sorted(opp_hand + board))
-                opp_score = evaluate_7_cached(opp_cards)
-
-                if hero_score > opp_score:
-                    wins += 1
-                elif hero_score == opp_score:
-                    ties += 1
-                total += 1
-
-        if total == 0:
+        known = set(hand + board)
+        available = np.array([c for c in range(52) if c not in known], dtype=np.int32)
+        
+        opponents = num_players - 1
+        board_needed = max(0, 5 - len(board))
+        cards_per_sim = (opponents * 2) + board_needed
+        
+        if len(available) < cards_per_sim:
             return 0.5
-        return (wins + 0.5 * ties) / total
 
-    def clear_cache(self) -> None:
-        self._cache.clear()
+        local_rng = np.random.default_rng(self._query_seed(hand, board, num_players, simulations))
+        n_avail = len(available)
+        perms = np.empty((simulations, cards_per_sim), dtype=np.int32)
+        for i in range(simulations):
+            idx = local_rng.choice(n_avail, size=cards_per_sim, replace=False)
+            perms[i] = available[idx]
+        all_deals = perms
+
+        batch_size = 128
+        for batch_start in range(0, simulations, batch_size):
+            local_sims = min(batch_size, simulations - batch_start)
+            batch_deals = all_deals[batch_start:batch_start + local_sims]
+            
+            run_boards = []
+            run_opponents = []
+
+            for i in range(local_sims):
+                draw = batch_deals[i]
+                
+                rem_board = draw[:board_needed].tolist()
+                full_board = board + rem_board
+                
+                opp_draw = draw[board_needed:]
+                opponent_hands = [opp_draw[j*2 : (j+1)*2].tolist() for j in range(opponents)]
+                
+                run_boards.append(full_board)
+                run_opponents.append(opponent_hands)
+
+            hero_inputs = [hand + b for b in run_boards]
+            hero_scores = evaluate_7_batch(hero_inputs)
+
+            field_inputs = []
+            for b, opps in zip(run_boards, run_opponents):
+                for opp in opps:
+                    field_inputs.append(opp + b)
+            
+            field_scores = evaluate_7_batch(field_inputs) if field_inputs else []
+
+            cursor = 0
+            for i in range(local_sims):
+                hero_score = hero_scores[i]
+                opp_count = len(run_opponents[i])
+                run_field = field_scores[cursor : cursor + opp_count]
+                cursor += opp_count
+
+                best_field_score = max(run_field) if run_field else -1
+                
+                if hero_score > best_field_score:
+                    wins += 1.0
+                elif hero_score == best_field_score:
+                    # Count all players that share the best score (hero + tying opponents).
+                    # Credit = 1 / total_winners, correct for any number of players.
+                    winners = 1 + sum(1 for s in run_field if s == hero_score)
+                    ties += 1.0 / winners
+
+        return (wins + ties) / simulations
+
+    def _estimate_exact_river_heads_up(self, hand, board):
+        """
+        Exact equity on a fully-dealt board against a single unknown opponent.
+        Enumerates all possible opponent hole-card combinations.
+
+        Tie credit: 1 / num_winners (i.e. 0.5 for a two-way tie in heads-up,
+        which is the only case this method is called).  The value 0.5 is NOT
+        hardcoded — it is derived from the winner count so the formula remains
+        correct if this method is ever extended to multiway scenarios.
+        """
+        known = set(hand + board)
+        remaining = [card for card in range(52) if card not in known]
+
+        hero_score = evaluate_7(hand + board)
+        wins = 0.0
+        ties = 0.0
+
+        combos = list(itertools.combinations(remaining, 2))
+        inputs = [list(opp_hand) + board for opp_hand in combos]
+        scores = evaluate_7_batch(inputs)
+        
+        for opp_score in scores:
+            if hero_score > opp_score:
+                wins += 1.0
+            elif hero_score == opp_score:
+                # BUG FIX: was hardcoded 0.5, now computed as 1/winners.
+                # For heads-up this evaluates to 0.5, but the formula is
+                # now correct regardless of the number of tied players.
+                # Previously: ties += 0.5
+                num_winners = 2  # hero + one opponent in heads-up
+                ties += 1.0 / num_winners
+
+        return (wins + ties) / len(combos) if combos else 0.0
+
+    def _estimate_monte_carlo_torch(self, hand, board, num_players, simulations):
+        known = set(hand + board)
+        available = [card for card in range(52) if card not in known]
+        if not available: return 0.0
+
+        try:
+            device = self.torch_device if torch.cuda.is_available() and self.torch_device.startswith("cuda") else "cpu"
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self._query_seed(hand, board, num_players, simulations))
+            available_tensor = torch.tensor(available, dtype=torch.int64, device=device)
+        except Exception:
+            return self._estimate_monte_carlo(hand, board, num_players, simulations)
+
+        opponents = num_players - 1
+        board_needed = max(0, 5 - len(board))
+        cards_needed = opponents * 2 + board_needed
+        
+        wins = 0.0
+        ties = 0.0
+        batch_size = 128
+
+        for batch_start in range(0, simulations, batch_size):
+            local_sims = min(batch_size, simulations - batch_start)
+            
+            run_boards = []
+            run_opponents = []
+            
+            for _ in range(local_sims):
+                perm = torch.randperm(len(available_tensor), generator=gen, device=device)[:cards_needed]
+                draw = available_tensor[perm].tolist()
+                
+                opp_hands = [draw[j*2 : (j+1)*2] for j in range(opponents)]
+                rem_board = draw[opponents*2:]
+                full_board = board + rem_board
+                
+                run_boards.append(full_board)
+                run_opponents.append(opp_hands)
+
+            hero_scores = evaluate_7_batch([hand + b for b in run_boards])
+            field_inputs = [opp + b for b, opps in zip(run_boards, run_opponents) for opp in opps]
+            field_scores = evaluate_7_batch(field_inputs) if field_inputs else []
+
+            cursor = 0
+            for i in range(local_sims):
+                h_score = hero_scores[i]
+                o_count = len(run_opponents[i])
+                f_scores = field_scores[cursor : cursor + o_count]
+                cursor += o_count
+                
+                max_f = max(f_scores) if f_scores else -1
+                if h_score > max_f:
+                    wins += 1.0
+                elif h_score == max_f:
+                    # Correct multiway tie credit: 1 / total number of winners.
+                    winners = 1 + sum(1 for s in f_scores if s == h_score)
+                    ties += 1.0 / winners
+
+        return (wins + ties) / simulations

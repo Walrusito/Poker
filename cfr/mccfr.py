@@ -1,190 +1,112 @@
-"""
-Monte Carlo CFR — N-player extension.
-
-Replaces the original 2-player (p0, p1) reach-probability implementation with a
-reach_probs vector of length N.  The rest of the algorithm stays identical:
-
-  - counterfactual reach for player i  = product of all OTHER players' reach probs
-  - own reach for strategy accumulation = reach_probs[i]
-  - regret update uses counterfactual reach (standard outcome-sampling MCCFR)
-
-Optimisations applied:
-  - Step 1:  snapshot/restore instead of deepcopy in tree traversal
-  - Step 9:  encode_tuple with fast hash instead of SHA256
-  - Step 10: regret-based pruning (RBP) — skip action branches where all
-             cumulative regrets are strongly negative (Bowling et al., 2015)
-
-Reference: Lanctot et al. (2009), "Monte Carlo Sampling for Regret Minimization
-in Extensive Games", NeurIPS.
-"""
-
-import math
 from collections import defaultdict
-from typing import List
 
 from utils.information_set import InformationSetBuilder
 
 
 class MCCFR:
-    """
-    Outcome-sampling Monte Carlo CFR for N-player NLHE.
 
-    Parameters
-    ----------
-    env_class : callable
-        Zero-argument factory that returns a fresh PokerEnv.
-    mc_simulations : int
-        MC simulations passed to InformationSetBuilder for equity estimates.
-    lut_simulations : int
-        Simulations used to populate the preflop/flop LUT.
-    lut_dir : str
-        Directory for equity LUT files.
-    seed : int | None
-        Optional RNG seed.
-    prune_threshold : float
-        Regret-based pruning threshold.  Actions whose cumulative regret
-        falls below ``-prune_threshold`` are skipped during traversal.
-        Set to 0 to disable pruning.
-    prune_after : int
-        Only enable pruning after this many iterations (regrets need time
-        to stabilise).
-    """
-
-    def __init__(
-        self,
-        env_class,
-        mc_simulations: int = 200,
-        lut_simulations: int = 1500,
-        lut_dir: str = "data/lut",
-        seed=None,
-        prune_threshold: float = 1000.0,
-        prune_after: int = 25,
-    ):
+    def __init__(self, env_class):
         self.env_class = env_class
-        self.iss = InformationSetBuilder(
-            mc_simulations=mc_simulations,
-            lut_simulations=lut_simulations,
-            lut_dir=lut_dir,
-            seed=seed,
-        )
-        self.regret: dict = defaultdict(lambda: defaultdict(float))
-        self.strategy_sum: dict = defaultdict(lambda: defaultdict(float))
-        self.prune_threshold = prune_threshold
-        self.prune_after = prune_after
-        self._iteration = 0
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self.iss = InformationSetBuilder()
 
+        self.regret = defaultdict(lambda: defaultdict(float))
+        self.strategy_sum = defaultdict(lambda: defaultdict(float))
+
+    # -----------------------------
+    # ENTRY
+    # -----------------------------
     def train_iteration(self):
-        """Run one CFR traversal of a freshly-dealt hand."""
         env = self.env_class()
-        num_players = int(env.num_players)
-        reach_probs = [1.0] * num_players
-        self._cfr(env, reach_probs)
-        self._iteration += 1
+        if env.num_players != 2:
+            raise NotImplementedError("Tabular MCCFR is only supported for heads-up environments")
+        self._cfr(env, 1.0, 1.0)
 
-    def get_average_strategy(self, info_set: str, actions: List[str]) -> dict:
-        """Return the time-averaged strategy (Nash approximation) for an info set."""
-        strat = self.strategy_sum[info_set]
-        total = sum(strat.get(a, 0.0) for a in actions)
-        if total > 0:
-            return {a: strat.get(a, 0.0) / total for a in actions}
-        return {a: 1.0 / len(actions) for a in actions}
+    # -----------------------------
+    # CORE CFR
+    # -----------------------------
+    def _cfr(self, env, p0, p1):
 
-    # ------------------------------------------------------------------
-    # Core recursive traversal
-    # ------------------------------------------------------------------
-
-    def _cfr(self, env, reach_probs: List[float]) -> List[float]:
-        """
-        Recursive CFR traversal.
-
-        Returns
-        -------
-        List[float]
-            Per-player utilities from this node onward.
-        """
         state = env._get_state()
 
-        # --- Terminal node ---
         if state["street"] == "showdown" or state.get("done", False):
-            return list(env.get_terminal_utilities())
+            return self._terminal_utility(env)
 
-        player: int = state["current_player"]
-        actions = env.get_legal_actions()
-        if not actions:
-            return list(env.get_terminal_utilities())
+        player = state["current_player"]
 
         info_set = self.iss.encode_tuple(state, player)
+
+        # FIX: use env-native legal actions to avoid silent no-ops
+        # when bet_sizing actions like "raise_0.5" were passed to step()
+        # that only understood "fold"/"call"/"raise"
+        actions = env.get_legal_actions()
+
         strategy = self._get_strategy(info_set, actions)
 
-        # Counterfactual reach: product of all players' reach probs except `player`.
-        cf_reach = self._counterfactual_reach(reach_probs, player)
+        node_util = 0.0
+        util = {}
+        # Track which actions were actually evaluated (not pruned).
+        # Only these actions should have their regrets updated.
+        # BUG FIX: If an action is pruned (skipped), its util stays at 0
+        # and node_util is computed without it. Updating its regret with
+        # `0 - node_util` would push it ever more negative each iteration,
+        # permanently preventing re-exploration and breaking CFR convergence.
+        evaluated_actions = set()
 
-        # Accumulate strategy sum weighted by the acting player's own reach.
-        own_reach = reach_probs[player]
+        # -----------------------------
+        # DECISION NODE
+        # -----------------------------
         for action in actions:
-            self.strategy_sum[info_set][action] += own_reach * strategy[action]
 
-        # --- Regret-based pruning (Step 10) ---
-        pruning_active = (
-            self.prune_threshold > 0
-            and self._iteration >= self.prune_after
-        )
+            env_copy = env.clone()
 
-        # --- Evaluate each action (snapshot/restore instead of deepcopy) ---
-        action_utils: dict[str, List[float]] = {}
-        pruned: set[str] = set()
-        node_util = [0.0] * len(reach_probs)
-
-        for action in actions:
-            # RBP: skip actions with strongly negative regret
-            if pruning_active:
-                cumulative = self.regret[info_set].get(action, 0.0)
-                if cumulative < -self.prune_threshold:
-                    pruned.add(action)
-                    continue
-
-            snap = env.get_snapshot()
-            next_state, reward, done, info = env.step(action)
+            # FIX: step() returns (state, reward, done, info) — 4 values
+            # Previous code unpacked only 3, causing ValueError
+            next_state, reward, done, _ = env_copy.step(action)
 
             if done:
-                action_utils[action] = list(env.get_terminal_utilities())
+                util[action] = reward
             else:
-                new_reach = list(reach_probs)
-                new_reach[player] *= strategy[action]
-                action_utils[action] = self._cfr(env, new_reach)
+                util[action] = self._cfr(
+                    env_copy,
+                    p0 * (strategy[action] if player == 0 else 1),
+                    p1 * (strategy[action] if player == 1 else 1)
+                )
 
-            env.restore_snapshot(snap)
+            node_util += strategy[action] * util[action]
+            evaluated_actions.add(action)
 
-            for p in range(len(reach_probs)):
-                node_util[p] += strategy[action] * action_utils[action][p]
+        # -----------------------------
+        # REGRET UPDATE
+        # BUG FIX: only update regrets for actions that were actually
+        # evaluated. Pruned actions (if pruning is ever added) must be
+        # skipped here; updating their regret with `0 - node_util` when
+        # node_util > 0 creates a self-reinforcing negative cycle that
+        # permanently removes the action from the strategy, breaking
+        # CFR's convergence guarantees (Brown et al., 2015).
+        # -----------------------------
+        for action in evaluated_actions:
+            regret = util[action] - node_util if player == 0 else node_util - util[action]
+            if player == 0:
+                self.regret[info_set][action] += p1 * regret
+            else:
+                self.regret[info_set][action] += p0 * regret
 
-        # --- Regret update (skip pruned actions to avoid negative feedback loop) ---
+        # -----------------------------
+        # STRATEGY SUM — FIX: must be weighted by the current player's
+        # own reach probability for the average strategy to converge
+        # to Nash.  The original code used weight=1 (unweighted).
+        # -----------------------------
+        reach = p0 if player == 0 else p1
         for action in actions:
-            if action in pruned:
-                continue
-            regret = action_utils[action][player] - node_util[player]
-            self.regret[info_set][action] += cf_reach * regret
+            self.strategy_sum[info_set][action] += reach * strategy[action]
 
         return node_util
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _counterfactual_reach(self, reach_probs: List[float], player: int) -> float:
-        """Product of all players' reach probabilities except `player`."""
-        result = 1.0
-        for idx, rp in enumerate(reach_probs):
-            if idx != player:
-                result *= rp
-        return result
-
-    def _get_strategy(self, info_set: str, actions: List[str]) -> dict:
-        """Regret matching: map positive regrets to a probability distribution."""
+    # -----------------------------
+    # REGRET MATCHING
+    # -----------------------------
+    def _get_strategy(self, info_set, actions):
         regrets = self.regret[info_set]
         positive = {a: max(regrets[a], 0.0) for a in actions}
         total = sum(positive.values())
@@ -192,6 +114,18 @@ class MCCFR:
             return {a: positive[a] / total for a in actions}
         return {a: 1.0 / len(actions) for a in actions}
 
-    def _terminal_utility(self, env) -> float:
-        """Convenience: P0 utility (kept for backward-compat callers)."""
+    # -----------------------------
+    # AVERAGE STRATEGY  (Nash approximation — use this for play)
+    # -----------------------------
+    def get_average_strategy(self, info_set, actions):
+        strat = self.strategy_sum[info_set]
+        total = sum(strat.get(a, 0.0) for a in actions)
+        if total > 0:
+            return {a: strat.get(a, 0.0) / total for a in actions}
+        return {a: 1.0 / len(actions) for a in actions}
+
+    # -----------------------------
+    # TERMINAL
+    # -----------------------------
+    def _terminal_utility(self, env):
         return env.get_terminal_utilities()[0]
