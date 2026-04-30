@@ -8,8 +8,10 @@ class ReservoirBuffer:
 
     Maintains a uniform distribution over all experiences seen in time.
 
-    FIX: sample() now returns a shuffled copy so training does not always
-    iterate in insertion order (which can create spurious gradient correlations).
+    Optimisations (Steps 4 & 5 from the performance plan):
+      - snapshot() returns the data list directly — DataLoader(shuffle=True)
+        handles ordering, avoiding redundant O(N) copy+shuffle.
+      - sample() kept for backward compatibility but marked as legacy.
     """
 
     def __init__(self, max_size: int = 50_000):
@@ -27,8 +29,12 @@ class ReservoirBuffer:
             if i < self.max_size:
                 self.data[i] = item
 
+    def snapshot(self) -> List[Any]:
+        """Return current buffer contents without copy — DataLoader handles shuffling."""
+        return self.data
+
     def sample(self) -> List[Any]:
-        """Return a shuffled copy of the buffer contents."""
+        """Legacy: return a shuffled copy. Prefer snapshot() with DataLoader(shuffle=True)."""
         shuffled = self.data.copy()
         random.shuffle(shuffled)
         return shuffled

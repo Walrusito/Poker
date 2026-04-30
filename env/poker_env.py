@@ -128,6 +128,73 @@ class PokerEnv:
         }
 
     # -------------------------------------------------------------------------
+    # SNAPSHOT / RESTORE  (Step 1 optimisation — replaces copy.deepcopy)
+    #
+    # O(num_players) snapshot using only primitive copies.  No object
+    # allocation beyond small lists.  Used by MCCFR to avoid the cost of
+    # deepcopy at every CFR tree node.
+    # -------------------------------------------------------------------------
+    def get_snapshot(self) -> tuple:
+        return (
+            list(self.stacks),
+            list(self.bets),
+            self.pot,
+            self.street,
+            self.current_player,
+            self.done,
+            list(self.board),
+            list(self.deck),
+            [list(h) for h in self.hands],
+            list(self.history),
+            list(self.street_actions),
+        )
+
+    def restore_snapshot(self, snap: tuple) -> None:
+        (self.stacks, self.bets, self.pot, self.street,
+         self.current_player, self.done, self.board, self.deck,
+         self.hands, self.history, self.street_actions) = (
+            list(snap[0]), list(snap[1]), snap[2], snap[3],
+            snap[4], snap[5], list(snap[6]), list(snap[7]),
+            [list(h) for h in snap[8]], list(snap[9]), list(snap[10]),
+        )
+
+    def clone(self):
+        """Lightweight clone using snapshot/restore instead of deepcopy."""
+        new = object.__new__(PokerEnv)
+        new.num_players = self.num_players
+        new.starting_stack = self.starting_stack
+        new.stacks = list(self.stacks)
+        new.bets = list(self.bets)
+        new.pot = self.pot
+        new.street = self.street
+        new.current_player = self.current_player
+        new.done = self.done
+        new.board = list(self.board)
+        new.deck = list(self.deck)
+        new.hands = [list(h) for h in self.hands]
+        new.history = list(self.history)
+        new.street_actions = list(self.street_actions)
+        return new
+
+    def get_terminal_utilities(self) -> List[float]:
+        """Return per-player utilities at a terminal node (zero-sum)."""
+        if not self.done:
+            return [0.0] * self.num_players
+        if self.num_players == 2:
+            r = self._terminal_reward_p0()
+            return [r, -r]
+        return [0.0] * self.num_players
+
+    def _terminal_reward_p0(self) -> float:
+        """Compute terminal reward from player-0's perspective."""
+        for player, action in self.history:
+            if action == "fold":
+                return self._fold_reward(player)
+        if self.street == "showdown":
+            return self._showdown()
+        return 0.0
+
+    # -------------------------------------------------------------------------
     # DECK / DEAL
     # -------------------------------------------------------------------------
     def _deal_hands(self) -> List[List[int]]:
